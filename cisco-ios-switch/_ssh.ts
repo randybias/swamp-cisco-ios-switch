@@ -154,8 +154,11 @@ function legacyAlgoFlags(): string[] {
   return [
     "-o",
     "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group1-sha1",
+    // ssh-dss (DSA host keys) was removed entirely from modern OpenSSH — including
+    // it makes the whole HostKeyAlgorithms list error ("Bad key types"). Old 2960
+    // images present an RSA host key, so +ssh-rsa is what actually matters.
     "-o",
-    "HostKeyAlgorithms=+ssh-rsa,ssh-dss",
+    "HostKeyAlgorithms=+ssh-rsa",
     "-o",
     "Ciphers=+aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc",
     "-o",
@@ -206,6 +209,11 @@ export async function runIosSession(
       "-tt",
       "-p",
       String(args.port),
+      // Host-key verification is intentionally disabled: these switches are
+      // managed over a trusted L2 management network and are commonly
+      // re-imaged (post-bootstrap), so there is no stable known_hosts entry to
+      // pin. This trades MITM protection for operability — only run this model
+      // against switches reachable over a trusted management path.
       "-o",
       "StrictHostKeyChecking=no",
       "-o",
