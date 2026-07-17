@@ -257,8 +257,17 @@ export async function runIosSession(
       const child = cmd.spawn();
       const writer = child.stdin.getWriter();
       await writer.write(new TextEncoder().encode(script));
-      await writer.close();
+      // Do NOT close stdin before reading the reply. With a forced PTY
+      // (`ssh -tt`), closing stdin sends EOF straight into the interactive IOS
+      // VTY, which tears the session down before it finishes running the
+      // script — only the first line's echo makes it back, so every command's
+      // captured output comes back empty. The script already ends with `exit`,
+      // which the device uses to close the session cleanly; `child.output()`
+      // then returns the full transcript. The AbortController above is the
+      // backstop if a device never closes the session. Release the writer
+      // afterward (the pipe is already gone once the remote exits).
       output = await child.output();
+      await writer.close().catch(() => {});
     } catch (e) {
       if (ac.signal.aborted) {
         throw new Error(
