@@ -89,12 +89,14 @@ export function parseShowVersion(text: string): {
 } {
   const uptimeMatch = text.match(/^(\S+)\s+uptime is\s+(.+)$/m);
   const versionMatch = text.match(/Version\s+([^\s,]+)/);
-  const modelMatch = text.match(
-    /(?:Model number\s*:\s*|cisco\s+)(\S*2960\S*|WS-\S+|C9\S+)/i,
+  const explicitModelMatch = text.match(/Model number\s*:\s*(\S+)/i);
+  const bannerModelMatch = text.match(
+    /\bcisco\s+(\S*(?:2960|C1000|C9)\S*)/i,
   );
   return {
     hostname: uptimeMatch?.[1]?.trim() ?? "",
-    model: modelMatch?.[1]?.trim() ?? "",
+    model: explicitModelMatch?.[1]?.trim() ??
+      bannerModelMatch?.[1]?.trim() ?? "",
     iosVersion: versionMatch?.[1]?.trim() ?? "",
     uptime: uptimeMatch?.[2]?.trim() ?? "",
   };
@@ -105,12 +107,57 @@ export function redactLine(line: string): string {
   return line
     .replace(/(snmp-server community\s+)(\S+)/i, "$1<redacted>")
     .replace(
-      /(snmp-server host\s+\S+\s+version\s+\S+\s+)(\S+)/i,
+      /(snmp-server host\s+\S+\s+(?:(?:traps|informs)\s+)?version\s+\S+\s+)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(snmp-server host\s+\S+\s+(?:traps|informs)\s+)(?!version\b)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(snmp-server host\s+\S+\s+)(?!(?:traps|informs|version)\b)(\S+)/i,
       "$1<redacted>",
     )
     // secret/password values can be "type hash" (e.g. "5 $1$..") — redact to EOL.
     .replace(/(\bsecret\s+)(.+)$/i, "$1<redacted>")
     .replace(/(\bpassword\s+)(.+)$/i, "$1<redacted>")
+    .replace(
+      /(\bsnmp-server\s+user\s+\S+\s+\S+\s+auth\s+\S+\s+)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(\bsnmp-server\s+user\b.*?\spriv\s+\S+(?:\s+\d+)?\s+)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(\b(?:radius|tacacs)-server(?:\s+host\s+\S+)?\s+key\s+(?:\d+\s+)?)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(\bserver-private\s+\S+.*?\skey\s+(?:\d+\s+)?)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(\bip\s+ospf\s+message-digest-key\s+\d+\s+\S+\s+(?:\d+\s+)?)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(\bip\s+ospf\s+authentication-key\s+(?:\d+\s+)?)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(\bntp\s+authentication-key\s+\d+\s+\S+\s+)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(\bcrypto\s+isakmp\s+key\s+(?:\d+\s+)?)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(
+      /(\bpre-shared-key\b.*?\bkey\s+(?:\d+\s+)?)(\S+)/i,
+      "$1<redacted>",
+    )
+    .replace(/(\bkey-string\s+(?:\d+\s+)?)(\S+)/i, "$1<redacted>")
     .replace(/(\bkey\s+)(\d.*)$/i, "$1<redacted>");
 }
 
@@ -119,10 +166,38 @@ export function redactConfig(config: string): string {
   return config
     .split(/\r?\n/)
     .map((l) =>
-      /^\s*(snmp-server community|enable (secret|password)|username .* (secret|password)|.*\bpassword\b|key\s+\d)/i
+      /^\s*(snmp-server\s+(?:community|host|user)|enable\s+(?:secret|password)|username\s+.*\s+(?:secret|password)|(?:radius|tacacs)-server\b.*\bkey|server-private\s+\S+.*\bkey|ip\s+ospf\s+(?:authentication-key|message-digest-key)|ntp\s+authentication-key|crypto\s+isakmp\s+key|pre-shared-key\b.*\bkey|neighbor\s+\S+\s+password|.*\bkey-string\s+(?:\d+\s+)?\S+|.*\bpassword\b|key\s+\d)/i
           .test(l)
         ? redactLine(l)
         : l
     )
     .join("\n");
+}
+
+const SENSITIVE_JSON_KEY_RE =
+  /(?:password|passphrase|secret|token|community|auth(?:entication)?|authkey|priv(?:acy)?|privkey|privacykey|privatekey|encryptionkey|keystring|apikey)$|^key$/i;
+
+function redactJsonValue(value: unknown, key = ""): unknown {
+  if (SENSITIVE_JSON_KEY_RE.test(key)) return "<redacted>";
+  if (Array.isArray(value)) {
+    return value.map((item) => redactJsonValue(item));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([childKey, childValue]) => [
+        childKey,
+        redactJsonValue(childValue, childKey.replace(/[-_]/g, "")),
+      ]),
+    );
+  }
+  return typeof value === "string" ? redactConfig(value) : value;
+}
+
+/** Redact text or JSON command output without corrupting structured JSON. */
+export function redactCommandOutput(output: string): string {
+  try {
+    return JSON.stringify(redactJsonValue(JSON.parse(output)));
+  } catch {
+    return redactConfig(output);
+  }
 }

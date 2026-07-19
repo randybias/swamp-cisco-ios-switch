@@ -1,7 +1,9 @@
 manifestVersion: 1
 name: "@dougschaefer/cisco-ios-switch"
-version: "2026.06.29.1"
-description: "Manage a Cisco IOS switch (e.g. Catalyst 2960) over SSH after console bootstrap — capture running-config and device facts, run verification commands, and push idempotent baselines: secure-access hardening, SNMPv2c, and Layer-3/VLAN/access-port config. Shells out to OpenSSH; vault-resolved credentials; live reachability pre-flight check."
+version: "2026.07.19.1"
+paths:
+  base: manifest
+description: "Manage a Cisco IOS switch over SSH after console bootstrap: capture redacted configuration and facts, run validated show commands, and explicitly dry-run or apply secure-access, SNMPv2c, routing, VLAN, and access-port intent. Vault-resolved credentials, explicit host-key/legacy-crypto policy, schema injection defenses, and configured-port pre-flight checks."
 repository: https://github.com/dougschaefer6/swamp-cisco-ios-switch
 additionalFiles:
   - README.md

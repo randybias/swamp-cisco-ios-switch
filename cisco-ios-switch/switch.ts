@@ -8,11 +8,87 @@ import {
 import {
   baselineLines,
   parseShowVersion,
+  redactCommandOutput,
   redactConfig,
   redactLine,
   routingLines,
   snmpLines,
 } from "./_config.ts";
+
+const ReadOnlyCommandSchema = z.string().transform((command) => command.trim())
+  .refine(
+    (command) =>
+      /^show(?:\s|$)/i.test(command) &&
+      !command.includes(">") &&
+      !/\|\s*(?:append|redirect|tee)(?:\s|$)/i.test(command) &&
+      ![...command].some((character) => {
+        const code = character.codePointAt(0)!;
+        return character === ";" || code < 32 || code === 127;
+      }),
+    "Each command must be a single read-only show command without output redirection",
+  );
+
+/** Injectable boundaries used by model entrypoint and failure-path tests. */
+export interface CiscoIosModelDependencies {
+  runSession: typeof runIosSession;
+  probeTcp: typeof probeTcp;
+  now: () => Date;
+}
+
+/** Migrate existing published definitions while preserving their old transport behavior. */
+export function upgradeGlobalArguments(
+  old: Record<string, unknown>,
+): Record<string, unknown> {
+  const upgraded: Record<string, unknown> = {
+    ...old,
+    port: old.port ?? 22,
+    hostKeyPolicy: old.hostKeyPolicy ?? "insecure",
+    legacyAlgorithms: old.legacyAlgorithms ?? true,
+    commandTimeoutMs: old.commandTimeoutMs ?? 20_000,
+  };
+  if (old.snmp && typeof old.snmp === "object") {
+    const snmp = { ...(old.snmp as Record<string, unknown>) };
+    // The published generator ignored trapHost unless readOnly existed. The
+    // hardened schema makes that dependency explicit, so discard an
+    // ineffective legacy trapHost rather than invalidating the definition.
+    if (snmp.trapHost && !snmp.readOnly) delete snmp.trapHost;
+    upgraded.snmp = snmp;
+  }
+  if (old.routing && typeof old.routing === "object") {
+    const routing = old.routing as Record<string, unknown>;
+    const enabled = routing.enabled ?? false;
+    const vlans = Array.isArray(routing.vlans)
+      ? routing.vlans.map((value) => {
+        if (!value || typeof value !== "object") return value;
+        const vlan = { ...(value as Record<string, unknown>) };
+        if (Boolean(vlan.sviIp) !== Boolean(vlan.sviMask)) {
+          delete vlan.sviIp;
+          delete vlan.sviMask;
+        }
+        return vlan;
+      })
+      : [];
+    const accessPorts = Array.isArray(routing.accessPorts)
+      ? routing.accessPorts.map((value) => {
+        if (!value || typeof value !== "object") return value;
+        const accessPort = value as Record<string, unknown>;
+        return {
+          ...accessPort,
+          description: accessPort.description ?? "",
+          portfast: accessPort.portfast ?? true,
+        };
+      })
+      : [];
+    upgraded.routing = {
+      ...routing,
+      enabled,
+      defaultRouteNextHop: enabled ? routing.defaultRouteNextHop : undefined,
+      vlans,
+      accessPorts,
+    };
+  }
+  return upgraded;
+}
 
 /**
  * `@dougschaefer/cisco-ios-switch` model — manages a Cisco IOS switch
@@ -21,8 +97,8 @@ import {
  *
  * `getRunningConfig` captures the running config (secrets redacted by
  * default) plus parsed model/IOS/uptime facts. `runCommands` runs
- * arbitrary EXEC/show commands and captures their output — the
- * verification surface. `applyBaseline` asserts idempotent secure-access
+ * validated show commands and captures redacted output — the verification
+ * surface. `applyBaseline` asserts idempotent secure-access
  * hardening (hostname, domain, password encryption, HTTP off, console
  * and VTY login/timeout, SSH-only transport). `pushSnmp` configures
  * SNMPv2c read-only/read-write communities, location, contact, and an
@@ -37,241 +113,310 @@ import {
  * lines without connecting. Connection facts and per-switch baseline
  * live in `globalArguments` (secrets vault-resolved).
  */
-export const model = {
-  type: "@dougschaefer/cisco-ios-switch",
-  version: "2026.06.29.1",
-  globalArguments: CiscoIosGlobalArgsSchema,
-  resources: {
-    status: {
-      description: "Parsed device facts: hostname, model, IOS version, uptime",
-      schema: z.object({
-        host: z.string(),
-        hostname: z.string(),
-        model: z.string(),
-        iosVersion: z.string(),
-        uptime: z.string(),
-        capturedAt: z.iso.datetime(),
-      }),
-      lifetime: "7d",
-      garbageCollection: 5,
-    },
-    commandResult: {
-      description: "Captured output of ad-hoc EXEC/show commands",
-      schema: z.object({
-        host: z.string(),
-        commands: z.array(z.object({
-          command: z.string(),
-          output: z.string(),
-        })),
-        capturedAt: z.iso.datetime(),
-      }),
-      lifetime: "7d",
-      garbageCollection: 5,
-    },
-    pushResult: {
-      description:
-        "Result of a configuration push: the applied IOS lines and whether it saved",
-      schema: z.object({
-        host: z.string(),
-        method: z.string(),
-        appliedLines: z.array(z.string()),
-        saved: z.boolean(),
-        dryRun: z.boolean(),
-        deviceOutput: z.string(),
-        appliedAt: z.iso.datetime(),
-      }),
-      lifetime: "30d",
-      garbageCollection: 10,
-    },
-  },
-  files: {
-    runningConfig: {
-      description:
-        "Captured running-config (secrets redacted unless redactSecrets=false)",
-      contentType: "text/plain",
-      lifetime: "7d",
-      garbageCollection: 5,
-    },
-  },
-  methods: {
-    getRunningConfig: {
-      description:
-        "Capture 'show running-config' and 'show version'; store the config file and parsed device facts. Read-only.",
-      arguments: z.object({
-        redactSecrets: z.boolean().default(true).describe(
-          "Strip community strings, secrets, and password lines before storing the config file.",
-        ),
-      }),
-      execute: async (
-        args: { redactSecrets: boolean },
-        context: MethodContext,
-      ) => {
-        const g = context.globalArgs;
-        context.logger.info("Capturing running-config from {host}", {
-          host: g.host,
-        });
-        const result = await runIosSession(g, {
-          execCommands: ["show version", "show running-config"],
-        });
-        const version = output(result.execOutputs, "show version");
-        const config = output(result.execOutputs, "show running-config");
-        const facts = parseShowVersion(version);
+export function createCiscoIosModel(
+  overrides: Partial<CiscoIosModelDependencies> = {},
+) {
+  const dependencies: CiscoIosModelDependencies = {
+    runSession: runIosSession,
+    probeTcp,
+    now: () => new Date(),
+    ...overrides,
+  };
 
-        const cfgWriter = context.createFileWriter(
-          "runningConfig",
-          `${g.host}-running`,
-        );
-        const cfgHandle = await cfgWriter.writeText(
-          args.redactSecrets ? redactConfig(config) : config,
-        );
-
-        const statusHandle = await context.writeResource(
-          "status",
-          `${g.host}-status`,
-          {
-            host: g.host,
-            hostname: facts.hostname,
-            model: facts.model,
-            iosVersion: facts.iosVersion,
-            uptime: facts.uptime,
-            capturedAt: new Date().toISOString(),
-          },
-        );
-        context.logger.info("Captured {model} running {version} from {host}", {
-          model: facts.model || "unknown",
-          version: facts.iosVersion || "unknown",
-          host: g.host,
-        });
-        return { dataHandles: [cfgHandle, statusHandle] };
+  return {
+    type: "@dougschaefer/cisco-ios-switch",
+    version: "2026.07.19.1",
+    globalArguments: CiscoIosGlobalArgsSchema,
+    upgrades: [
+      {
+        toVersion: "2026.07.19.1",
+        description:
+          "Require explicit transport policy for new definitions while preserving the prior port, insecure host-key, legacy-algorithm, timeout, and routing defaults on existing definitions",
+        upgradeAttributes: upgradeGlobalArguments,
+      },
+    ],
+    resources: {
+      status: {
+        description:
+          "Parsed device facts: hostname, model, IOS version, uptime",
+        schema: z.object({
+          host: z.string(),
+          hostname: z.string(),
+          model: z.string(),
+          iosVersion: z.string(),
+          uptime: z.string(),
+          capturedAt: z.iso.datetime(),
+        }),
+        lifetime: "7d",
+        garbageCollection: 5,
+      },
+      commandResult: {
+        description: "Captured output of ad-hoc EXEC/show commands",
+        schema: z.object({
+          host: z.string(),
+          commands: z.array(z.object({
+            command: z.string(),
+            output: z.string(),
+          })),
+          capturedAt: z.iso.datetime(),
+        }),
+        lifetime: "7d",
+        garbageCollection: 5,
+      },
+      pushResult: {
+        description:
+          "Result of a configuration push: the applied IOS lines and whether it saved",
+        schema: z.object({
+          host: z.string(),
+          method: z.string(),
+          appliedLines: z.array(z.string()),
+          saved: z.boolean(),
+          dryRun: z.boolean(),
+          deviceOutput: z.string(),
+          appliedAt: z.iso.datetime(),
+        }),
+        lifetime: "30d",
+        garbageCollection: 10,
       },
     },
-
-    runCommands: {
-      description:
-        "Run arbitrary EXEC/show commands and capture their output. Use for verification (e.g. 'show ip ssh', 'show ip route').",
-      arguments: z.object({
-        commands: z.array(z.string()).min(1).describe(
-          "EXEC/show commands to run",
-        ),
-      }),
-      execute: async (args: { commands: string[] }, context: MethodContext) => {
-        const g = context.globalArgs;
-        context.logger.info("Running {count} command(s) on {host}", {
-          count: args.commands.length,
-          host: g.host,
-        });
-        const result = await runIosSession(g, { execCommands: args.commands });
-        const handle = await context.writeResource(
-          "commandResult",
-          `${g.host}-cmds`,
-          {
-            host: g.host,
-            commands: result.execOutputs,
-            capturedAt: new Date().toISOString(),
-          },
-        );
-        context.logger.info(
-          "Captured output for {count} command(s) on {host}",
-          {
-            count: result.execOutputs.length,
-            host: g.host,
-          },
-        );
-        return { dataHandles: [handle] };
+    files: {
+      runningConfig: {
+        description:
+          "Captured running-config (secrets redacted unless redactSecrets=false)",
+        contentType: "text/plain",
+        lifetime: "7d",
+        garbageCollection: 5,
       },
     },
+    methods: {
+      getRunningConfig: {
+        description:
+          "Capture 'show running-config' and 'show version'; store the config file and parsed device facts. Read-only.",
+        arguments: z.object({
+          redactSecrets: z.boolean().default(true).describe(
+            "Strip community strings, secrets, and password lines before storing the config file.",
+          ),
+        }),
+        execute: async (
+          args: { redactSecrets: boolean },
+          context: MethodContext,
+        ) => {
+          const g = context.globalArgs;
+          context.logger.info("Capturing running-config from {host}", {
+            host: g.host,
+          });
+          const result = await dependencies.runSession(g, {
+            execCommands: ["show version", "show running-config"],
+          });
+          const version = requiredOutput(result.execOutputs, "show version");
+          const config = requiredOutput(
+            result.execOutputs,
+            "show running-config",
+          );
+          const facts = parseShowVersion(version);
 
-    applyBaseline: {
-      description:
-        "Assert idempotent secure-access hardening: hostname/domain, service password-encryption, HTTP off, console + VTY login/timeout, SSH-only transport. Saves to startup.",
-      arguments: z.object({
-        dryRun: z.boolean().default(false),
-      }),
-      execute: async (args: { dryRun: boolean }, context: MethodContext) => {
-        const g = context.globalArgs;
-        const lines = baselineLines(g);
-        return await applyConfig(
-          context,
+          const cfgWriter = context.createFileWriter(
+            "runningConfig",
+            `${g.host}-running`,
+          );
+          const cfgHandle = await cfgWriter.writeText(
+            args.redactSecrets ? redactConfig(config) : config,
+          );
+
+          const statusHandle = await context.writeResource(
+            "status",
+            `${g.host}-status`,
+            {
+              host: g.host,
+              hostname: facts.hostname,
+              model: facts.model,
+              iosVersion: facts.iosVersion,
+              uptime: facts.uptime,
+              capturedAt: dependencies.now().toISOString(),
+            },
+          );
+          context.logger.info(
+            "Captured {model} running {version} from {host}",
+            {
+              model: facts.model || "unknown",
+              version: facts.iosVersion || "unknown",
+              host: g.host,
+            },
+          );
+          return { dataHandles: [cfgHandle, statusHandle] };
+        },
+      },
+
+      runCommands: {
+        description:
+          "Run validated single-line show commands and capture their output with known configuration secrets redacted by default. Newlines, semicolons, non-show commands, and device-storage redirection are rejected.",
+        arguments: z.object({
+          commands: z.array(ReadOnlyCommandSchema).min(1).max(100).describe(
+            "Read-only show commands to run",
+          ),
+          redactSecrets: z.boolean().default(true).describe(
+            "Redact known IOS configuration secrets from captured output.",
+          ),
+        }),
+        execute: async (
+          args: { commands: string[]; redactSecrets: boolean },
+          context: MethodContext,
+        ) => {
+          const g = context.globalArgs;
+          context.logger.info("Running {count} command(s) on {host}", {
+            count: args.commands.length,
+            host: g.host,
+          });
+          const result = await dependencies.runSession(g, {
+            execCommands: args.commands,
+          });
+          const commands = args.redactSecrets
+            ? result.execOutputs.map(({ command, output }) => ({
+              command,
+              output: redactCommandOutput(output),
+            }))
+            : result.execOutputs;
+          const handle = await context.writeResource(
+            "commandResult",
+            `${g.host}-cmds`,
+            {
+              host: g.host,
+              commands,
+              capturedAt: dependencies.now().toISOString(),
+            },
+          );
+          context.logger.info(
+            "Captured output for {count} command(s) on {host}",
+            {
+              count: commands.length,
+              host: g.host,
+            },
+          );
+          return { dataHandles: [handle] };
+        },
+      },
+
+      applyBaseline: {
+        description:
+          "Assert idempotent secure-access hardening: hostname/domain, service password-encryption, HTTP off, console + VTY login/timeout, SSH-only transport. Saves to startup.",
+        arguments: z.object({
+          dryRun: z.boolean().describe(
+            "Required safety choice: true renders without connecting; false applies and saves on the switch.",
+          ),
+        }),
+        execute: async (args: { dryRun: boolean }, context: MethodContext) => {
+          const g = context.globalArgs;
+          logMutationEntry(context, "applyBaseline", args.dryRun);
+          const lines = baselineLines(g);
+          return await applyConfig(
+            context,
+            "applyBaseline",
+            lines,
+            args.dryRun,
+            false,
+            dependencies,
+          );
+        },
+      },
+
+      pushSnmp: {
+        description:
+          "Configure SNMPv2c read-only/read-write communities, location, contact, and optional trap host from globalArguments.snmp. Saves to startup.",
+        arguments: z.object({
+          dryRun: z.boolean().describe(
+            "Required safety choice: true renders without connecting; false applies and saves on the switch.",
+          ),
+        }),
+        execute: async (args: { dryRun: boolean }, context: MethodContext) => {
+          const g = context.globalArgs;
+          logMutationEntry(context, "pushSnmp", args.dryRun);
+          if (!g.snmp || (!g.snmp.readOnly && !g.snmp.readWrite)) {
+            throw new Error(
+              "globalArguments.snmp must define at least one of readOnly / readWrite",
+            );
+          }
+          const lines = snmpLines(g);
+          // Redact community strings from the stored record (secrets).
+          return await applyConfig(
+            context,
+            "pushSnmp",
+            lines,
+            args.dryRun,
+            true,
+            dependencies,
+          );
+        },
+      },
+
+      pushRouting: {
+        description:
+          "Apply Layer-3 intent from globalArguments.routing: ip routing, VLANs/SVIs, default route, and access-port assignments. Saves to startup.",
+        arguments: z.object({
+          dryRun: z.boolean().describe(
+            "Required safety choice: true renders without connecting; false applies and saves on the switch.",
+          ),
+        }),
+        execute: async (args: { dryRun: boolean }, context: MethodContext) => {
+          const g = context.globalArgs;
+          logMutationEntry(context, "pushRouting", args.dryRun);
+          if (!g.routing) {
+            throw new Error(
+              "globalArguments.routing is required for pushRouting",
+            );
+          }
+          const lines = routingLines(g);
+          if (lines.length === 0) {
+            throw new Error(
+              "globalArguments.routing produced no configuration",
+            );
+          }
+          return await applyConfig(
+            context,
+            "pushRouting",
+            lines,
+            args.dryRun,
+            false,
+            dependencies,
+          );
+        },
+      },
+    },
+    checks: {
+      "switch-reachable": {
+        description:
+          "TCP-probe the configured switch SSH port before running a method.",
+        labels: ["live"],
+        appliesTo: [
+          "getRunningConfig",
+          "runCommands",
           "applyBaseline",
-          lines,
-          args.dryRun,
-          false,
-        );
-      },
-    },
-
-    pushSnmp: {
-      description:
-        "Configure SNMPv2c read-only/read-write communities, location, contact, and optional trap host from globalArguments.snmp. Saves to startup.",
-      arguments: z.object({
-        dryRun: z.boolean().default(false),
-      }),
-      execute: async (args: { dryRun: boolean }, context: MethodContext) => {
-        const g = context.globalArgs;
-        if (!g.snmp || (!g.snmp.readOnly && !g.snmp.readWrite)) {
-          throw new Error(
-            "globalArguments.snmp must define at least one of readOnly / readWrite",
-          );
-        }
-        const lines = snmpLines(g);
-        // Redact community strings from the stored record (secrets).
-        return await applyConfig(context, "pushSnmp", lines, args.dryRun, true);
-      },
-    },
-
-    pushRouting: {
-      description:
-        "Apply Layer-3 intent from globalArguments.routing: ip routing, VLANs/SVIs, default route, and access-port assignments. Saves to startup.",
-      arguments: z.object({
-        dryRun: z.boolean().default(false),
-      }),
-      execute: async (args: { dryRun: boolean }, context: MethodContext) => {
-        const g = context.globalArgs;
-        if (!g.routing) {
-          throw new Error(
-            "globalArguments.routing is required for pushRouting",
-          );
-        }
-        const lines = routingLines(g);
-        if (lines.length === 0) {
-          throw new Error("globalArguments.routing produced no configuration");
-        }
-        return await applyConfig(
-          context,
+          "pushSnmp",
           "pushRouting",
-          lines,
-          args.dryRun,
-          false,
-        );
+        ],
+        execute: async (context: CheckContext): Promise<CheckResult> => {
+          const { host, port, commandTimeoutMs } = context.globalArgs;
+          const timeoutMs = Math.max(3000, Math.min(commandTimeoutMs, 10000));
+          try {
+            await dependencies.probeTcp(host, port, timeoutMs);
+            return { pass: true };
+          } catch (e) {
+            return {
+              pass: false,
+              errors: [
+                `${host}:${port} not reachable over TCP (${
+                  e instanceof Error ? e.message : String(e)
+                }). Bootstrap the switch over the console first, or skip with --skip-check-label live.`,
+              ],
+            };
+          }
+        },
       },
     },
-  },
-  checks: {
-    "switch-reachable": {
-      description:
-        "TCP-probe the switch SSH port before pushing configuration.",
-      labels: ["live"],
-      appliesTo: ["applyBaseline", "pushSnmp", "pushRouting"],
-      execute: async (context: CheckContext): Promise<CheckResult> => {
-        const { host, port, commandTimeoutMs } = context.globalArgs;
-        const timeoutMs = Math.max(3000, Math.min(commandTimeoutMs, 10000));
-        try {
-          await probeTcp(host, port, timeoutMs);
-          return { pass: true };
-        } catch (e) {
-          return {
-            pass: false,
-            errors: [
-              `${host}:${port} not reachable over TCP (${
-                e instanceof Error ? e.message : String(e)
-              }). Bootstrap the switch over the console first, or skip with --skip-check-label live.`,
-            ],
-          };
-        }
-      },
-    },
-  },
-};
+  };
+}
+
+/** Production model using the real SSH, TCP, and clock boundaries. */
+export const model = createCiscoIosModel();
 
 /** Context passed to pre-flight checks (no data-writing surface). */
 interface CheckContext {
@@ -283,11 +428,16 @@ interface CheckResult {
   errors?: string[];
 }
 
+type TcpConnect = (
+  options: Deno.ConnectOptions,
+) => Promise<{ close(): void }>;
+
 /** Open a TCP connection within `timeoutMs`, closing it (or a late one) immediately. */
-function probeTcp(
+export function probeTcp(
   hostname: string,
   port: number,
   timeoutMs: number,
+  connect: TcpConnect = Deno.connect,
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let done = false;
@@ -296,7 +446,7 @@ function probeTcp(
       done = true;
       reject(new Error(`timed out after ${timeoutMs} ms`));
     }, timeoutMs);
-    Deno.connect({ hostname, port }).then(
+    connect({ hostname, port }).then(
       (conn) => {
         clearTimeout(timer);
         conn.close();
@@ -320,7 +470,6 @@ interface MethodContext {
   globalArgs: CiscoIosGlobalArgs;
   logger: {
     info: (msg: string, props?: Record<string, unknown>) => void;
-    warning: (msg: string, props?: Record<string, unknown>) => void;
   };
   writeResource: (
     spec: string,
@@ -344,17 +493,9 @@ async function applyConfig(
   lines: string[],
   dryRun: boolean,
   redactStored: boolean,
+  dependencies: CiscoIosModelDependencies,
 ): Promise<{ dataHandles: DataHandle[] }> {
   const g = context.globalArgs;
-  context.logger.info(
-    "Applying {method} to {host} ({count} lines, dryRun={dryRun})",
-    {
-      method,
-      host: g.host,
-      count: lines.length,
-      dryRun,
-    },
-  );
   const storedLines = redactStored ? lines.map(redactLine) : lines;
   if (dryRun) {
     const handle = await context.writeResource(
@@ -367,14 +508,37 @@ async function applyConfig(
         saved: false,
         dryRun: true,
         deviceOutput: "(dry run — not connected)",
-        appliedAt: new Date().toISOString(),
+        appliedAt: dependencies.now().toISOString(),
       },
     );
+    context.logger.info("Rendered {method} for {host} (dryRun=true)", {
+      method,
+      host: g.host,
+    });
     return { dataHandles: [handle] };
   }
-  const result = await runIosSession(g, { configLines: lines, save: true });
-  const err = findIosError(result.transcript);
-  if (err) throw new Error(`${method} failed: ${err}`);
+  const applyResult = await dependencies.runSession(g, {
+    configLines: lines,
+  });
+  const applyError = findIosError(applyResult.transcript);
+  if (applyError) throw new Error(`${method} failed: ${applyError}`);
+
+  // Persist only after the configuration session completed without an IOS
+  // rejection. This deliberately uses a second, independently verified VTY
+  // session so a bad line can never be followed by `write memory` in the same
+  // pre-buffered script.
+  const saveResult = await dependencies.runSession(g, {
+    execCommands: ["write memory"],
+  });
+  const saveError = findIosError(saveResult.transcript);
+  if (saveError) throw new Error(`${method} save failed: ${saveError}`);
+  const saveOutput = saveResult.execOutputs.find((entry) =>
+    entry.command === "write memory"
+  )?.output;
+  if (!saveOutput || !/\[OK\]/i.test(saveOutput)) {
+    throw new Error(`${method} save failed: IOS did not acknowledge [OK]`);
+  }
+  const transcript = `${applyResult.transcript}\n${saveResult.transcript}`;
   const handle = await context.writeResource(
     "pushResult",
     `${g.host}-${method}`,
@@ -386,8 +550,8 @@ async function applyConfig(
       dryRun: false,
       deviceOutput: redactStored
         ? "(suppressed — contains secrets)"
-        : tail(result.transcript, 2000),
-      appliedAt: new Date().toISOString(),
+        : redactCommandOutput(tail(transcript, 2000)),
+      appliedAt: dependencies.now().toISOString(),
     },
   );
   context.logger.info("Applied {method} to {host} (saved=true)", {
@@ -399,11 +563,26 @@ async function applyConfig(
 
 // ---- private helpers ----
 
-function output(
+function logMutationEntry(
+  context: MethodContext,
+  method: string,
+  dryRun: boolean,
+): void {
+  context.logger.info(
+    "Preparing {method} for {host} (dryRun={dryRun})",
+    { method, host: context.globalArgs.host, dryRun },
+  );
+}
+
+function requiredOutput(
   execOutputs: { command: string; output: string }[],
   cmd: string,
 ): string {
-  return execOutputs.find((e) => e.command === cmd)?.output ?? "";
+  const value = execOutputs.find((entry) => entry.command === cmd)?.output;
+  if (!value?.trim()) {
+    throw new Error(`SSH session returned no output for '${cmd}'`);
+  }
+  return value;
 }
 
 function tail(s: string, n: number): string {
