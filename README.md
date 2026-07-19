@@ -1,10 +1,10 @@
 # @dougschaefer/cisco-ios-switch
 
-A [Swamp](https://swamp-club.com/) extension model for managing a
-Cisco IOS switch (e.g. Catalyst 2960) **over SSH** after it has been
-bootstrapped at the console. It drives the interactive VTY the way an operator
-would — disable the pager, optionally enter enable mode, push config, and
-`write memory` — capturing the transcript and parsing device facts.
+A [Swamp](https://swamp-club.com/) extension model for managing a Cisco IOS
+switch (e.g. Catalyst 2960) **over SSH** after it has been bootstrapped at the
+console. It drives the interactive VTY the way an operator would — disable the
+pager, optionally enter enable mode, push config, and `write memory` — capturing
+the transcript and parsing device facts.
 
 ## What it does and does not do
 
