@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@dougschaefer/cisco-ios-switch"
-version: "2026.07.19.1"
+version: "2026.07.20.1"
 paths:
   base: manifest
 description: "Manage a Cisco IOS switch over SSH after console bootstrap: capture redacted configuration and facts, run validated show commands, and explicitly dry-run or apply secure-access, SNMPv2c, routing, VLAN, and access-port intent. Vault-resolved credentials, explicit host-key/legacy-crypto policy, schema injection defenses, and configured-port pre-flight checks."

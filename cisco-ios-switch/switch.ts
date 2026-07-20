@@ -91,6 +91,26 @@ export function upgradeGlobalArguments(
 }
 
 /**
+ * Narrow globalArgs to a fully-configured connection ahead of a
+ * single-target method. Bare fleet instances (globalArguments: {})
+ * intentionally have no host/username/password — discoverFleet supplies
+ * those per target instead.
+ */
+export function requireGlobalConnection(
+  g: CiscoIosGlobalArgs,
+): asserts g is CiscoIosGlobalArgs & {
+  host: string;
+  username: string;
+  password: string;
+} {
+  if (!g.host || !g.username || !g.password) {
+    throw new Error(
+      "This model instance has no host/username/password in globalArguments — single-target methods require a per-device instance (see discoverFleet for bare fleet instances).",
+    );
+  }
+}
+
+/**
  * `@dougschaefer/cisco-ios-switch` model — manages a Cisco IOS switch
  * (e.g. Catalyst 2960) over SSH after it has been bootstrapped at the
  * console. It drives the interactive VTY the way an operator would.
@@ -125,7 +145,7 @@ export function createCiscoIosModel(
 
   return {
     type: "@dougschaefer/cisco-ios-switch",
-    version: "2026.07.19.1",
+    version: "2026.07.20.1",
     globalArguments: CiscoIosGlobalArgsSchema,
     upgrades: [
       {
@@ -133,6 +153,12 @@ export function createCiscoIosModel(
         description:
           "Require explicit transport policy for new definitions while preserving the prior port, insecure host-key, legacy-algorithm, timeout, and routing defaults on existing definitions",
         upgradeAttributes: upgradeGlobalArguments,
+      },
+      {
+        toVersion: "2026.07.20.1",
+        description:
+          "host/username/password become optional (a bare fleet instance has neither); port/hostKeyPolicy/legacyAlgorithms/commandTimeoutMs are now schema-level defaults instead of required fields — existing values are preserved unchanged",
+        upgradeAttributes: (old: Record<string, unknown>) => old,
       },
     ],
     resources: {
@@ -202,6 +228,7 @@ export function createCiscoIosModel(
           context: MethodContext,
         ) => {
           const g = context.globalArgs;
+          requireGlobalConnection(g);
           context.logger.info("Capturing running-config from {host}", {
             host: g.host,
           });
@@ -263,6 +290,7 @@ export function createCiscoIosModel(
           context: MethodContext,
         ) => {
           const g = context.globalArgs;
+          requireGlobalConnection(g);
           context.logger.info("Running {count} command(s) on {host}", {
             count: args.commands.length,
             host: g.host,
@@ -306,6 +334,7 @@ export function createCiscoIosModel(
         }),
         execute: async (args: { dryRun: boolean }, context: MethodContext) => {
           const g = context.globalArgs;
+          requireGlobalConnection(g);
           logMutationEntry(context, "applyBaseline", args.dryRun);
           const lines = baselineLines(g);
           return await applyConfig(
@@ -329,6 +358,7 @@ export function createCiscoIosModel(
         }),
         execute: async (args: { dryRun: boolean }, context: MethodContext) => {
           const g = context.globalArgs;
+          requireGlobalConnection(g);
           logMutationEntry(context, "pushSnmp", args.dryRun);
           if (!g.snmp || (!g.snmp.readOnly && !g.snmp.readWrite)) {
             throw new Error(
@@ -358,6 +388,7 @@ export function createCiscoIosModel(
         }),
         execute: async (args: { dryRun: boolean }, context: MethodContext) => {
           const g = context.globalArgs;
+          requireGlobalConnection(g);
           logMutationEntry(context, "pushRouting", args.dryRun);
           if (!g.routing) {
             throw new Error(
@@ -397,7 +428,10 @@ export function createCiscoIosModel(
           const { host, port, commandTimeoutMs } = context.globalArgs;
           const timeoutMs = Math.max(3000, Math.min(commandTimeoutMs, 10000));
           try {
-            await dependencies.probeTcp(host, port, timeoutMs);
+            // TODO(Task 7): host is optional post-Task-5; this check does not
+            // yet guard a hostless bare instance — Task 7 replaces this cast
+            // with a real early return.
+            await dependencies.probeTcp(host as string, port, timeoutMs);
             return { pass: true };
           } catch (e) {
             return {

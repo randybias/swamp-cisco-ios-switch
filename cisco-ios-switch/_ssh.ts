@@ -179,14 +179,18 @@ const RoutingSchema = z.object({
  * facts plus the per-switch baseline this model asserts over SSH.
  */
 export const CiscoIosGlobalArgsSchema = z.object({
-  host: HostSchema.describe("Management IP or hostname of the switch"),
-  port: z.number().int().min(1).max(65535).describe("SSH port"),
+  host: HostSchema.optional().describe(
+    "Management IP or hostname of the switch. Omit on a bare fleet instance — discoverFleet supplies it per target.",
+  ),
+  port: z.number().int().min(1).max(65535).default(22).describe("SSH port"),
   username: z.string().min(1).regex(
     /^[A-Za-z0-9._-]+$/,
     "Username may contain only letters, digits, dot, underscore, and hyphen",
-  ).describe("SSH username (a privilege-15 local user)"),
-  password: VaultValueSchema.meta({ sensitive: true }).describe(
-    "SSH password. Use: ${{ vault.get(your-vault, <switch>-admin) }}",
+  ).optional().describe(
+    "SSH username (a privilege-15 local user). Omit on a bare fleet instance.",
+  ),
+  password: VaultValueSchema.optional().meta({ sensitive: true }).describe(
+    "SSH password. Use: ${{ vault.get(your-vault, <switch>-admin) }}. Omit on a bare fleet instance.",
   ),
   enableSecret: VaultValueSchema.optional().meta({ sensitive: true }).describe(
     "Enable secret. Set ONLY if the login does not land in privileged EXEC; sends 'enable' + this secret. Leave unset for a privilege-15 login.",
@@ -197,15 +201,16 @@ export const CiscoIosGlobalArgsSchema = z.object({
   domainName: DomainNameSchema.optional().describe(
     "IP domain-name asserted by applyBaseline.",
   ),
-  hostKeyPolicy: z.enum(["strict", "insecure"]).describe(
+  hostKeyPolicy: z.enum(["strict", "insecure"]).default("insecure").describe(
     "Host-key verification policy. Use strict whenever a trusted known_hosts entry is available; insecure is an explicit compatibility opt-out.",
   ),
-  legacyAlgorithms: z.boolean().describe(
+  legacyAlgorithms: z.boolean().default(true).describe(
     "Append legacy SSH kex/cipher/host-key algorithms to the offer for old IOS images.",
   ),
-  commandTimeoutMs: z.number().int().min(1000).max(300_000).describe(
-    "SSH connect timeout (seconds, rounded up) and the per-session output read budget, in milliseconds.",
-  ),
+  commandTimeoutMs: z.number().int().min(1000).max(300_000).default(20_000)
+    .describe(
+      "SSH connect timeout (seconds, rounded up) and the per-session output read budget, in milliseconds.",
+    ),
   snmp: SnmpSchema.optional().describe("SNMPv2c configuration (pushSnmp)"),
   routing: RoutingSchema.optional().describe(
     "Layer-3 / VLAN configuration (pushRouting)",
@@ -341,6 +346,12 @@ export async function runIosSession(
   plan: IosPlan,
   spawn: IosSpawn = spawnDenoCommand,
 ): Promise<IosResult> {
+  const { host, username, password } = args;
+  if (!host || !username || !password) {
+    throw new Error(
+      "runIosSession requires host, username, and password on globalArgs",
+    );
+  }
   const sent = buildScript(plan);
   const script = sent.join("\n") + "\n";
 
@@ -349,7 +360,7 @@ export async function runIosSession(
   const pwFile = `${tmp}/pw`;
   const askpass = `${tmp}/askpass.sh`;
   try {
-    await Deno.writeTextFile(pwFile, args.password);
+    await Deno.writeTextFile(pwFile, password);
     await Deno.chmod(pwFile, 0o600);
     await Deno.writeTextFile(
       askpass,
@@ -561,7 +572,7 @@ function redactKnownSecrets(
   args: CiscoIosGlobalArgs,
 ): string {
   return redactValues(value, [
-    args.password,
+    args.password ?? "",
     args.enableSecret ?? "",
     args.snmp?.readOnly ?? "",
     args.snmp?.readWrite ?? "",
@@ -572,7 +583,7 @@ function redactTransportSecrets(
   value: string,
   args: CiscoIosGlobalArgs,
 ): string {
-  return redactValues(value, [args.password, args.enableSecret ?? ""]);
+  return redactValues(value, [args.password ?? "", args.enableSecret ?? ""]);
 }
 
 function redactValues(value: string, values: string[]): string {

@@ -54,7 +54,7 @@ const globalArgs = CiscoIosGlobalArgsSchema.parse({
   hostKeyPolicy: "strict",
   legacyAlgorithms: false,
   commandTimeoutMs: 20_000,
-});
+}) as CiscoIosGlobalArgs & { host: string; username: string; password: string };
 
 /** Build validated global args for line-generator and model tests. */
 function args(partial: Partial<CiscoIosGlobalArgs>): CiscoIosGlobalArgs {
@@ -154,22 +154,30 @@ Deno.test("global schema accepts explicit secure transport facts", () => {
   assertEquals(snmpSchema.shape.readWrite.meta()?.sensitive, true);
 });
 
-Deno.test("global schema requires all transport policy fields", () => {
-  for (
-    const field of [
-      "host",
-      "port",
-      "username",
-      "password",
-      "hostKeyPolicy",
-      "legacyAlgorithms",
-      "commandTimeoutMs",
-    ]
-  ) {
-    const incomplete = { ...globalArgs } as Record<string, unknown>;
-    delete incomplete[field];
-    assertThrows(() => CiscoIosGlobalArgsSchema.parse(incomplete));
-  }
+Deno.test("global arguments validate as fully empty (bare fleet instance)", () => {
+  const parsed = CiscoIosGlobalArgsSchema.parse({});
+  assertEquals(parsed.port, 22);
+  assertEquals(parsed.commandTimeoutMs, 20_000);
+  assertEquals(parsed.hostKeyPolicy, "insecure");
+  assertEquals(parsed.legacyAlgorithms, true);
+  assertEquals(parsed.host, undefined);
+});
+
+Deno.test("getRunningConfig rejects a bare instance with no host/username/password", async () => {
+  const testModel = createCiscoIosModel();
+  const harness = createModelTestContext({
+    globalArgs: CiscoIosGlobalArgsSchema.parse({}),
+    methodName: "getRunningConfig",
+  });
+  await assertRejects(
+    () =>
+      testModel.methods.getRunningConfig.execute(
+        testModel.methods.getRunningConfig.arguments.parse({}),
+        harness.context as never,
+      ),
+    Error,
+    "no host/username/password",
+  );
 });
 
 Deno.test("global schema rejects malformed targets, credentials, and timeouts", () => {
