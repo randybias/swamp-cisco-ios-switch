@@ -1287,6 +1287,109 @@ Deno.test("configuration entrypoints reject missing intent and IOS failures", as
   );
 });
 
+const fleetTarget = {
+  name: "sw-a",
+  class: "cisco_ios_switch" as const,
+  host: "sw-a.example.test",
+  port: 22,
+  username: "automation",
+  password: "synthetic-password",
+  hostKeyPolicy: "insecure" as const,
+  legacyAlgorithms: true,
+  commandTimeoutMs: 20_000,
+};
+
+Deno.test("discoverFleet captures version, config, and LLDP for every target in one execution", async () => {
+  const testModel = createCiscoIosModel({
+    probeTcp: () => Promise.resolve(),
+    runSession: (_args, plan) =>
+      Promise.resolve({
+        transcript: "synthetic transcript",
+        execOutputs: (plan.execCommands ?? []).map((command) => ({
+          command,
+          output: command === "show version"
+            ? showVersion
+            : command === "show running-config"
+            ? runningConfig
+            : "synthetic lldp output",
+        })),
+      }),
+    now: () => new Date("2026-01-10T12:00:00.000Z"),
+  });
+  const harness = createModelTestContext({
+    globalArgs: CiscoIosGlobalArgsSchema.parse({}),
+    methodName: "discoverFleet",
+  });
+  const args = testModel.methods.discoverFleet.arguments.parse({
+    targets: [fleetTarget],
+  });
+
+  const result = await testModel.methods.discoverFleet.execute(
+    args,
+    harness.context as never,
+  );
+
+  assertEquals(result.dataHandles.length, 4);
+  const resources = harness.getWrittenResources();
+  const summary = resources.find((r) => r.specName === "fleetSummary")!;
+  assertEquals(summary.data.succeeded, 1);
+  const status = resources.find((r) => r.specName === "status")!;
+  assertEquals(status.name, "sw-a-status");
+});
+
+Deno.test("discoverFleet isolates one target's failure from the rest of the fleet", async () => {
+  const failing = { ...fleetTarget, name: "sw-b", host: "sw-b.example.test" };
+  const testModel = createCiscoIosModel({
+    probeTcp: (host) =>
+      host === failing.host
+        ? Promise.reject(new Error("connection refused"))
+        : Promise.resolve(),
+    runSession: (_args, plan) =>
+      Promise.resolve({
+        transcript: "synthetic transcript",
+        execOutputs: (plan.execCommands ?? []).map((command) => ({
+          command,
+          output: command === "show version" ? showVersion : runningConfig,
+        })),
+      }),
+  });
+  const harness = createModelTestContext({
+    globalArgs: CiscoIosGlobalArgsSchema.parse({}),
+    methodName: "discoverFleet",
+  });
+  const args = testModel.methods.discoverFleet.arguments.parse({
+    targets: [fleetTarget, failing],
+  });
+
+  await testModel.methods.discoverFleet.execute(args, harness.context as never);
+
+  const summary = harness.getWrittenResources().find((r) =>
+    r.specName === "fleetSummary"
+  )!;
+  assertEquals(summary.data.total, 2);
+  assertEquals(summary.data.succeeded, 1);
+  assertEquals(summary.data.failed, 1);
+});
+
+Deno.test("discoverFleet rejects duplicate target names before execution", () => {
+  assertThrows(() =>
+    model.methods.discoverFleet.arguments.parse({
+      targets: [fleetTarget, { ...fleetTarget, host: "other.example.test" }],
+    })
+  );
+});
+
+Deno.test("discoverFleet bounds one execution to 64 targets", () => {
+  assertThrows(() =>
+    model.methods.discoverFleet.arguments.parse({
+      targets: Array.from({ length: 65 }, (_, i) => ({
+        ...fleetTarget,
+        name: `sw-${i}`,
+      })),
+    })
+  );
+});
+
 Deno.test("switch-reachable check uses explicit configured port and bounded timeout", async () => {
   let probe: { host: string; port: number; timeoutMs: number } | undefined;
   const passingModel = createCiscoIosModel({

@@ -221,6 +221,40 @@ export type CiscoIosGlobalArgs = z.infer<typeof CiscoIosGlobalArgsSchema>;
 export type Vlan = z.infer<typeof VlanSchema>;
 export type AccessPortRange = z.infer<typeof AccessPortRangeSchema>;
 
+/** One named Cisco IOS switch target in a discoverFleet run. */
+export const CiscoFleetTargetSchema = z.object({
+  name: z.string().trim().min(1).max(128).regex(
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/,
+    "name must start with a letter or digit and contain only letters, digits, dot, underscore, or hyphen",
+  ).describe(
+    "Stable device name/identifier used as the resource-instance stem.",
+  ),
+  class: z.literal("cisco_ios_switch").describe(
+    "Device class discriminator for the fleet-discovery contract.",
+  ),
+  host: HostSchema.describe("Management IP or hostname of the switch"),
+  port: z.number().int().min(1).max(65535).default(22).describe("SSH port"),
+  username: z.string().min(1).regex(
+    /^[A-Za-z0-9._-]+$/,
+    "Username may contain only letters, digits, dot, underscore, and hyphen",
+  ).describe("SSH username (a privilege-15 local user)"),
+  password: VaultValueSchema.meta({ sensitive: true }).describe(
+    "SSH password. Use: ${{ vault.get(your-vault, <switch>-admin) }}",
+  ),
+  hostKeyPolicy: z.enum(["strict", "insecure"]).default("insecure").describe(
+    "Host-key verification policy for this target.",
+  ),
+  legacyAlgorithms: z.boolean().default(true).describe(
+    "Append legacy SSH kex/cipher/host-key algorithms to the offer for this target.",
+  ),
+  commandTimeoutMs: z.number().int().min(1000).max(300_000).default(20_000)
+    .describe(
+      "SSH connect timeout and per-session read budget, in milliseconds.",
+    ),
+});
+
+export type CiscoFleetTarget = z.infer<typeof CiscoFleetTargetSchema>;
+
 /** A unit of work for one SSH session. */
 export interface IosPlan {
   /** EXEC/show commands run for their output (not inside config mode). */

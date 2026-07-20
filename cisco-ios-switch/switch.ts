@@ -1,5 +1,7 @@
 import { z } from "npm:zod@4.3.6";
 import {
+  type CiscoFleetTarget,
+  CiscoFleetTargetSchema,
   type CiscoIosGlobalArgs,
   CiscoIosGlobalArgsSchema,
   findIosError,
@@ -27,6 +29,66 @@ const ReadOnlyCommandSchema = z.string().transform((command) => command.trim())
       }),
     "Each command must be a single read-only show command without output redirection",
   );
+
+/** Per-target outcome of one discoverFleet run. */
+export interface FleetTargetResult {
+  name: string;
+  host: string;
+  ok: boolean;
+  error?: string;
+}
+
+const FleetSummarySchema = z.object({
+  capturedAt: z.iso.datetime(),
+  total: z.number().int(),
+  succeeded: z.number().int(),
+  failed: z.number().int(),
+  results: z.array(z.object({
+    name: z.string(),
+    host: z.string(),
+    ok: z.boolean(),
+    error: z.string().optional(),
+  })),
+});
+
+const FleetArgumentsSchema = z.object({
+  targets: z.array(CiscoFleetTargetSchema).min(1).max(64).describe(
+    "Named Cisco IOS switch targets to discover in this run.",
+  ),
+}).superRefine(({ targets }, context) => {
+  const names = new Set<string>();
+  for (const [index, target] of targets.entries()) {
+    if (names.has(target.name)) {
+      context.addIssue({
+        code: "custom",
+        path: ["targets", index, "name"],
+        message: `duplicate target name '${target.name}'`,
+      });
+    }
+    names.add(target.name);
+  }
+});
+
+/** Roll one fleet run's outcomes into a deterministic pass/fail summary. */
+function summarizeFleetResults(results: FleetTargetResult[]): {
+  total: number;
+  succeeded: number;
+  failed: number;
+  results: FleetTargetResult[];
+} {
+  const succeeded = results.filter((r) => r.ok).length;
+  return {
+    total: results.length,
+    succeeded,
+    failed: results.length - succeeded,
+    results,
+  };
+}
+
+/** Redact one credential defensively from a recorded failure message. */
+function redactTargetSecret(value: string, secret: string): string {
+  return secret.length > 0 ? value.replaceAll(secret, "***") : value;
+}
 
 /** Injectable boundaries used by model entrypoint and failure-path tests. */
 export interface CiscoIosModelDependencies {
@@ -203,6 +265,13 @@ export function createCiscoIosModel(
         }),
         lifetime: "30d",
         garbageCollection: 10,
+      },
+      fleetSummary: {
+        description:
+          "Per-target pass/fail summary of the most recent discoverFleet fan-out run",
+        schema: FleetSummarySchema,
+        lifetime: "7d",
+        garbageCollection: 5,
       },
     },
     files: {
@@ -409,6 +478,132 @@ export function createCiscoIosModel(
             false,
             dependencies,
           );
+        },
+      },
+
+      discoverFleet: {
+        description:
+          "Discover a named array of Cisco IOS switch targets in one execution. Each target is TCP-probed, then captures show version + running-config + LLDP neighbor detail in one SSH session; failures are recorded without aborting the remaining fleet. Read-only.",
+        arguments: FleetArgumentsSchema,
+        execute: async (
+          args: { targets: CiscoFleetTarget[] },
+          context: MethodContext,
+        ) => {
+          const handles: DataHandle[] = [];
+          const results: FleetTargetResult[] = [];
+          context.logger.info(
+            "Starting IOS discovery for {count} target(s)",
+            { count: args.targets.length },
+          );
+
+          for (const target of args.targets) {
+            try {
+              await dependencies.probeTcp(
+                target.host,
+                target.port,
+                Math.max(3000, Math.min(target.commandTimeoutMs, 10000)),
+              );
+              const sessionArgs: CiscoIosGlobalArgs = {
+                host: target.host,
+                port: target.port,
+                username: target.username,
+                password: target.password,
+                hostKeyPolicy: target.hostKeyPolicy,
+                legacyAlgorithms: target.legacyAlgorithms,
+                commandTimeoutMs: target.commandTimeoutMs,
+              };
+              const result = await dependencies.runSession(sessionArgs, {
+                execCommands: [
+                  "show version",
+                  "show running-config",
+                  "show lldp neighbors detail",
+                ],
+              });
+              const version = requiredOutput(
+                result.execOutputs,
+                "show version",
+              );
+              const config = requiredOutput(
+                result.execOutputs,
+                "show running-config",
+              );
+              const lldp = requiredOutput(
+                result.execOutputs,
+                "show lldp neighbors detail",
+              );
+              const facts = parseShowVersion(version);
+
+              const cfgHandle = await context.createFileWriter(
+                "runningConfig",
+                `${target.name}-running`,
+              ).writeText(redactConfig(config));
+              const statusHandle = await context.writeResource(
+                "status",
+                `${target.name}-status`,
+                {
+                  host: target.host,
+                  hostname: facts.hostname,
+                  model: facts.model,
+                  iosVersion: facts.iosVersion,
+                  uptime: facts.uptime,
+                  capturedAt: dependencies.now().toISOString(),
+                },
+              );
+              const lldpHandle = await context.writeResource(
+                "commandResult",
+                `${target.name}-cmds`,
+                {
+                  host: target.host,
+                  commands: [{
+                    command: "show lldp neighbors detail",
+                    output: redactCommandOutput(lldp),
+                  }],
+                  capturedAt: dependencies.now().toISOString(),
+                },
+              );
+              handles.push(cfgHandle, statusHandle, lldpHandle);
+              results.push({ name: target.name, host: target.host, ok: true });
+              context.logger.info(
+                "Captured {model} running {version} from {name} ({host})",
+                {
+                  model: facts.model || "unknown",
+                  version: facts.iosVersion || "unknown",
+                  name: target.name,
+                  host: target.host,
+                },
+              );
+            } catch (e) {
+              const error = redactTargetSecret(
+                redactTargetSecret(
+                  e instanceof Error ? e.message : String(e),
+                  target.password,
+                ),
+                target.username,
+              );
+              results.push({
+                name: target.name,
+                host: target.host,
+                ok: false,
+                error,
+              });
+              context.logger.info(
+                "Skipping {name} ({host}) after a discovery failure: {error}",
+                { name: target.name, host: target.host, error },
+              );
+            }
+          }
+
+          const summary = summarizeFleetResults(results);
+          const summaryHandle = await context.writeResource(
+            "fleetSummary",
+            "fleet-summary",
+            { ...summary, capturedAt: dependencies.now().toISOString() },
+          );
+          context.logger.info(
+            "Fleet discovery complete: {succeeded}/{total} succeeded",
+            { succeeded: summary.succeeded, total: summary.total },
+          );
+          return { dataHandles: [...handles, summaryHandle] };
         },
       },
     },
