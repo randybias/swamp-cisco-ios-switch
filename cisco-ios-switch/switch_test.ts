@@ -1390,6 +1390,19 @@ Deno.test("discoverFleet bounds one execution to 64 targets", () => {
   );
 });
 
+Deno.test("switch-reachable check fails cleanly with no probe on a bare instance", async () => {
+  const testModel = createCiscoIosModel({
+    probeTcp: () => {
+      throw new Error("probeTcp must not be called for a hostless instance");
+    },
+  });
+  const result = await testModel.checks["switch-reachable"].execute({
+    globalArgs: CiscoIosGlobalArgsSchema.parse({}),
+  });
+  assertEquals(result.pass, false);
+  assert(result.errors?.[0].includes("not configured"));
+});
+
 Deno.test("switch-reachable check uses explicit configured port and bounded timeout", async () => {
   let probe: { host: string; port: number; timeoutMs: number } | undefined;
   const passingModel = createCiscoIosModel({

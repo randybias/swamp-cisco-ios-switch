@@ -621,12 +621,17 @@ export function createCiscoIosModel(
         ],
         execute: async (context: CheckContext): Promise<CheckResult> => {
           const { host, port, commandTimeoutMs } = context.globalArgs;
+          if (!host) {
+            return {
+              pass: false,
+              errors: [
+                "globalArguments.host is not configured on this instance — bare fleet instances have no single-target host to probe; use discoverFleet instead.",
+              ],
+            };
+          }
           const timeoutMs = Math.max(3000, Math.min(commandTimeoutMs, 10000));
           try {
-            // TODO(Task 7): host is optional post-Task-5; this check does not
-            // yet guard a hostless bare instance — Task 7 replaces this cast
-            // with a real early return.
-            await dependencies.probeTcp(host as string, port, timeoutMs);
+            await dependencies.probeTcp(host, port, timeoutMs);
             return { pass: true };
           } catch (e) {
             return {
