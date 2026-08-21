@@ -102,6 +102,88 @@ export function parseShowVersion(text: string): {
   };
 }
 
+/**
+ * Parse `show mac address-table` into rows, normalizing each MAC to the
+ * colon-separated uppercase form the inventory DB uses (`mac_address.mac_address`),
+ * so a caller can join on it without re-normalizing.
+ *
+ * WHY THIS EXISTS: a MAC being LEARNED on a switch port is an out-of-band witness
+ * that a device is powered and transmitting, obtained without touching the device.
+ * That is the only signal that separates "the address we hold is stale" from "the
+ * device is dead" -- two states that look identical from the address alone, and
+ * which were confused in both directions on 2026-08-21 (a healthy iDRAC that had
+ * moved VLAN was diagnosed as dead, and that diagnosis then propagated into an
+ * extension's docs and a T1 workflow before the switch MAC table settled it).
+ *
+ * PARSED BY TOKEN SHAPE, NOT BY COLUMN POSITION. Each line is anchored on the
+ * Cisco dotted-triple MAC and the remaining tokens are classified by what they
+ * look like -- a numeric-or-"All" VLAN, a known entry type, and the ports. This
+ * repo has already been bitten by positional parsing (`mstconfig`'s column order
+ * is Default/Current/NextBoot, which is not the order anyone assumes), so column
+ * order is deliberately not relied on here. Header, separator, and total lines
+ * carry no dotted MAC and are skipped as a consequence of the anchor rather than
+ * by pattern-matching their text, which also means a firmware release that
+ * reworks the banner cannot break this.
+ *
+ * Entry TYPE is preserved rather than reduced to a boolean: only a DYNAMIC entry
+ * proves current transmission. A STATIC entry is configuration, and the CPU
+ * entries are the switch talking about itself -- treating either as a liveness
+ * witness would manufacture evidence.
+ */
+export function parseMacAddressTable(text: string): Array<{
+  vlan: string;
+  mac: string;
+  type: string;
+  ports: string[];
+}> {
+  const DOTTED = /^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$/;
+  const KNOWN_TYPES = new Set([
+    "dynamic",
+    "static",
+    "sticky",
+    "secure",
+    "self",
+    "igmp",
+  ]);
+  const rows: Array<
+    { vlan: string; mac: string; type: string; ports: string[] }
+  > = [];
+  for (const line of text.split(/\r?\n/)) {
+    const tokens = line.trim().split(/\s+/).filter((t) => t.length > 0);
+    const macIdx = tokens.findIndex((t) => DOTTED.test(t));
+    if (macIdx === -1) continue;
+    const mac = normalizeCiscoMac(tokens[macIdx]);
+    const rest = tokens.filter((_, i) => i !== macIdx);
+    let vlan = "";
+    let type = "";
+    const ports: string[] = [];
+    for (const t of rest) {
+      if (!vlan && (/^\d+$/.test(t) || t.toLowerCase() === "all")) {
+        vlan = t;
+      } else if (!type && KNOWN_TYPES.has(t.toLowerCase())) {
+        type = t.toUpperCase();
+      } else {
+        ports.push(t);
+      }
+    }
+    rows.push({ vlan, mac, type, ports });
+  }
+  return rows;
+}
+
+/**
+ * `6c3c.8c99.550b` -> `6C:3C:8C:99:55:0B`.
+ *
+ * Cisco prints dotted-triple; the inventory DB stores colon-separated uppercase.
+ * Normalizing at the parse boundary means exactly one representation leaves this
+ * module, so a caller cannot accidentally compare the two forms and get a false
+ * "not found" -- the same class of silent miss as the `port.mac`/`has_mac` split.
+ */
+export function normalizeCiscoMac(dotted: string): string {
+  const hex = dotted.replace(/\./g, "").toUpperCase();
+  return hex.match(/.{2}/g)?.join(":") ?? dotted.toUpperCase();
+}
+
 /** Replace community/secret/password/key values on a single config line. */
 export function redactLine(line: string): string {
   return line

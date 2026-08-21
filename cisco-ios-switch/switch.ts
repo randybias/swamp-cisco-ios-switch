@@ -9,6 +9,7 @@ import {
 } from "./_ssh.ts";
 import {
   baselineLines,
+  parseMacAddressTable,
   parseShowVersion,
   redactCommandOutput,
   redactConfig,
@@ -251,6 +252,24 @@ export function createCiscoIosModel(
         lifetime: "7d",
         garbageCollection: 5,
       },
+      macTable: {
+        description:
+          "Parsed `show mac address-table` rows -- the out-of-band liveness witness. A DYNAMIC entry proves the device behind that MAC is powered and transmitting, without touching the device.",
+        schema: z.object({
+          host: z.string(),
+          rows: z.array(z.object({
+            vlan: z.string(),
+            mac: z.string(),
+            type: z.string(),
+            ports: z.array(z.string()),
+          })),
+          dynamicCount: z.number(),
+          totalCount: z.number(),
+          capturedAt: z.iso.datetime(),
+        }),
+        lifetime: "7d",
+        garbageCollection: 5,
+      },
       pushResult: {
         description:
           "Result of a configuration push: the applied IOS lines and whether it saved",
@@ -388,6 +407,44 @@ export function createCiscoIosModel(
               count: commands.length,
               host: g.host,
             },
+          );
+          return { dataHandles: [handle] };
+        },
+      },
+
+      getMacTable: {
+        description:
+          "Read `show mac address-table` and return it parsed, with every MAC normalized to the colon-separated uppercase form the inventory DB uses. Read-only. This is the OUT-OF-BAND LIVENESS WITNESS: a DYNAMIC entry proves the device behind that MAC is powered and transmitting, established from the switch without touching the device at all -- so it still answers when the device's own management address does not. That distinction is the point. An address that does not respond is indistinguishable from a dead device UNTIL you have this: on 2026-08-21 an iDRAC was diagnosed as dead when it had merely moved VLAN, and its MAC was being learned dynamically on the OOB switch port the entire time. Entry TYPE is returned rather than reduced to a boolean, because only DYNAMIC proves current transmission -- STATIC is configuration and the CPU rows are the switch describing itself; counting either as liveness would manufacture evidence. This method reports the table and draws NO conclusion about any device.",
+        arguments: z.object({}),
+        execute: async (
+          _args: Record<string, never>,
+          context: MethodContext,
+        ) => {
+          const g = context.globalArgs;
+          requireGlobalConnection(g);
+          context.logger.info("Reading MAC address-table from {host}", {
+            host: g.host,
+          });
+          const result = await dependencies.runSession(g, {
+            execCommands: ["show mac address-table"],
+          });
+          const text = result.execOutputs.map((o) => o.output).join("\n");
+          const rows = parseMacAddressTable(text);
+          const dynamicCount = rows.filter((r) => r.type === "DYNAMIC").length;
+          const handle = await context.writeResource(
+            "macTable",
+            `${g.host}-mac-table`,
+            {
+              host: g.host,
+              rows,
+              dynamicCount,
+              totalCount: rows.length,
+              capturedAt: dependencies.now().toISOString(),
+            },
+          );
+          context.logger.info(
+            "Parsed {total} MAC entries from {host} ({dynamic} dynamic)",
+            { total: rows.length, dynamic: dynamicCount, host: g.host },
           );
           return { dataHandles: [handle] };
         },

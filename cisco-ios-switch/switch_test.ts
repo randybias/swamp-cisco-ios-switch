@@ -7,6 +7,8 @@ import {
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20260706.24";
 import {
   baselineLines,
+  normalizeCiscoMac,
+  parseMacAddressTable,
   parseShowVersion,
   redactCommandOutput,
   redactConfig,
@@ -1486,4 +1488,87 @@ Deno.test("probeTcp closes successful and late connections and normalizes failur
   await assertRejects(() => lateFailure, Error, "timed out after 1 ms");
   rejectLate?.(new Error("late refusal"));
   await new Promise((resolve) => setTimeout(resolve, 0));
+});
+
+// --- MAC address-table parsing -------------------------------------------------
+// The banner/separator/total lines are REAL 2960X output shape. The nvl4 row is a
+// measured datum: gpu-imager observed MAC 6c3c.8c99.550b learned dynamically on
+// oob-sw5 Gi1/0/18 on 2026-08-21, which is what proved a supposedly-dead iDRAC was
+// alive on another VLAN.
+const MAC_TABLE_OUTPUT = `          Mac Address Table
+-------------------------------------------
+
+Vlan    Mac Address       Type        Ports
+----    -----------       --------    -----
+ All    0100.0ccc.cccc    STATIC      CPU
+ All    0180.c200.0000    STATIC      CPU
+   1    dcce.c170.1c80    DYNAMIC     Gi1/0/41
+1972    6c3c.8c99.550b    DYNAMIC     Gi1/0/18
+   1    aabb.ccdd.eeff    STATIC      Gi1/0/2
+Total Mac Addresses for this criterion: 5
+`;
+
+Deno.test("parseMacAddressTable normalizes to the DB's MAC form and keeps the entry type", () => {
+  const rows = parseMacAddressTable(MAC_TABLE_OUTPUT);
+  assertEquals(
+    rows.length,
+    5,
+    "banner, column header, separator and total lines must not become rows",
+  );
+
+  const nvl4 = rows.find((r) => r.mac === "6C:3C:8C:99:55:0B");
+  assert(
+    nvl4,
+    "the measured nvl4 iDRAC MAC must parse, in colon-uppercase form -- a dotted-triple leaking out would silently fail every join against the inventory DB",
+  );
+  assertEquals(nvl4!.vlan, "1972");
+  assertEquals(nvl4!.type, "DYNAMIC");
+  assertEquals(nvl4!.ports, ["Gi1/0/18"]);
+
+  // Only DYNAMIC is a liveness witness. If STATIC or the CPU rows counted, this
+  // switch would "prove" three devices alive that it is merely configured for.
+  assertEquals(rows.filter((r) => r.type === "DYNAMIC").length, 2);
+  const cpu = rows.filter((r) => r.ports.includes("CPU"));
+  assertEquals(cpu.length, 2);
+  assert(
+    cpu.every((r) => r.type === "STATIC"),
+    "CPU entries are the switch describing itself, never a device witness",
+  );
+});
+
+Deno.test("parseMacAddressTable does not depend on column ORDER", () => {
+  // Same three fields, columns permuted. Positional parsing would map vlan->type
+  // and type->vlan here; this repo has already paid for that with mstconfig's
+  // Default/Current/NextBoot ordering.
+  const permuted = `Type        Mac Address       Vlan    Ports
+DYNAMIC     6c3c.8c99.550b    1972    Gi1/0/18
+`;
+  const rows = parseMacAddressTable(permuted);
+  assertEquals(rows.length, 1);
+  assertEquals(rows[0].mac, "6C:3C:8C:99:55:0B");
+  assertEquals(rows[0].vlan, "1972");
+  assertEquals(rows[0].type, "DYNAMIC");
+  assertEquals(rows[0].ports, ["Gi1/0/18"]);
+});
+
+Deno.test("parseMacAddressTable returns empty for output with no entries, and does not invent rows", () => {
+  const empty = `          Mac Address Table
+-------------------------------------------
+
+Vlan    Mac Address       Type        Ports
+----    -----------       --------    -----
+Total Mac Addresses for this criterion: 0
+`;
+  assertEquals(parseMacAddressTable(empty).length, 0);
+  assertEquals(parseMacAddressTable("").length, 0);
+  // An error string from a failed command must not parse as a table either.
+  assertEquals(
+    parseMacAddressTable("% Invalid input detected at '^' marker.").length,
+    0,
+  );
+});
+
+Deno.test("normalizeCiscoMac converts dotted-triple to the DB's colon-uppercase form", () => {
+  assertEquals(normalizeCiscoMac("6c3c.8c99.550b"), "6C:3C:8C:99:55:0B");
+  assertEquals(normalizeCiscoMac("DCCE.C170.1C80"), "DC:CE:C1:70:1C:80");
 });
