@@ -1516,10 +1516,10 @@ Deno.test("parseMacAddressTable normalizes to the DB's MAC form and keeps the en
     "banner, column header, separator and total lines must not become rows",
   );
 
-  const nvl4 = rows.find((r) => r.mac === "6C:3C:8C:99:55:0B");
+  const nvl4 = rows.find((r) => r.mac === "6c:3c:8c:99:55:0b");
   assert(
     nvl4,
-    "the measured nvl4 iDRAC MAC must parse, in colon-uppercase form -- a dotted-triple leaking out would silently fail every join against the inventory DB",
+    "the measured nvl4 iDRAC MAC must parse, in colon-uppercase form -- a dotted-triple OR an uppercase form leaking out would silently fail every join against mac_address, which is lowercase on all 249 rows",
   );
   assertEquals(nvl4!.vlan, "1972");
   assertEquals(nvl4!.type, "DYNAMIC");
@@ -1545,7 +1545,7 @@ DYNAMIC     6c3c.8c99.550b    1972    Gi1/0/18
 `;
   const rows = parseMacAddressTable(permuted);
   assertEquals(rows.length, 1);
-  assertEquals(rows[0].mac, "6C:3C:8C:99:55:0B");
+  assertEquals(rows[0].mac, "6c:3c:8c:99:55:0b");
   assertEquals(rows[0].vlan, "1972");
   assertEquals(rows[0].type, "DYNAMIC");
   assertEquals(rows[0].ports, ["Gi1/0/18"]);
@@ -1569,6 +1569,9 @@ Total Mac Addresses for this criterion: 0
 });
 
 Deno.test("normalizeCiscoMac converts dotted-triple to the DB's colon-uppercase form", () => {
-  assertEquals(normalizeCiscoMac("6c3c.8c99.550b"), "6C:3C:8C:99:55:0B");
-  assertEquals(normalizeCiscoMac("DCCE.C170.1C80"), "DC:CE:C1:70:1C:80");
+  assertEquals(normalizeCiscoMac("6c3c.8c99.550b"), "6c:3c:8c:99:55:0b");
+  // Uppercase INPUT must still come out lowercase -- Cisco prints either, and
+  // mac_address.mac_address is lowercase on all 249 rows. This assertion is the
+  // one that fails if someone "fixes" the normalizer back to uppercase.
+  assertEquals(normalizeCiscoMac("DCCE.C170.1C80"), "dc:ce:c1:70:1c:80");
 });

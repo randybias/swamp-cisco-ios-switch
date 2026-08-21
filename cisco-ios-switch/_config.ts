@@ -104,7 +104,7 @@ export function parseShowVersion(text: string): {
 
 /**
  * Parse `show mac address-table` into rows, normalizing each MAC to the
- * colon-separated uppercase form the inventory DB uses (`mac_address.mac_address`),
+ * colon-separated LOWERCASE form of `mac_address.mac_address` (measured: 249/249 rows),
  * so a caller can join on it without re-normalizing.
  *
  * WHY THIS EXISTS: a MAC being LEARNED on a switch port is an out-of-band witness
@@ -172,16 +172,30 @@ export function parseMacAddressTable(text: string): Array<{
 }
 
 /**
- * `6c3c.8c99.550b` -> `6C:3C:8C:99:55:0B`.
+ * `6C3C.8C99.550B` -> `6c:3c:8c:99:55:0b`.
  *
- * Cisco prints dotted-triple; the inventory DB stores colon-separated uppercase.
- * Normalizing at the parse boundary means exactly one representation leaves this
- * module, so a caller cannot accidentally compare the two forms and get a false
- * "not found" -- the same class of silent miss as the `port.mac`/`has_mac` split.
+ * Cisco prints dotted-triple; the canonical MAC table in the inventory DB
+ * (`mac_address.mac_address`) stores colon-separated LOWERCASE. Measured, not
+ * assumed: all 249 rows are lowercase and zero are uppercase.
+ *
+ * ⚠️ CASE IS NOT CONSISTENT ACROSS THE DB, AND THAT IS THE TRAP HERE. The other
+ * table holding MACs -- `lldp_neighbor.remote_chassis_mac` -- is UPPERCASE
+ * (measured: 'DC:CE:C1:70:1C:80'). So there is no single "the DB's MAC form", and
+ * a caller joining against lldp_neighbor rather than mac_address must uppercase
+ * this output. Two tables, one fact class, opposite conventions; a join across
+ * them silently returns nothing.
+ *
+ * This function returned UPPERCASE in its first version, which would have produced
+ * a false "not found" against every one of those 249 rows -- precisely the silent
+ * miss the normalization exists to prevent, built into the thing preventing it. The
+ * cause is worth recording because it is not carelessness: the inventory skill DOES
+ * show an uppercase colon-separated MAC, but as an example of
+ * lldp_neighbor.remote_chassis_mac. Reading a real example from the wrong table is
+ * indistinguishable from reading the right one until you count both.
  */
 export function normalizeCiscoMac(dotted: string): string {
-  const hex = dotted.replace(/\./g, "").toUpperCase();
-  return hex.match(/.{2}/g)?.join(":") ?? dotted.toUpperCase();
+  const hex = dotted.replace(/\./g, "").toLowerCase();
+  return hex.match(/.{2}/g)?.join(":") ?? dotted.toLowerCase();
 }
 
 /** Replace community/secret/password/key values on a single config line. */
