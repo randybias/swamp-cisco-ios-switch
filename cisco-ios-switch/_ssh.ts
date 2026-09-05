@@ -178,8 +178,25 @@ const RoutingSchema = z.object({
  * Global arguments for a managed Cisco IOS switch: SSH connection
  * facts plus the per-switch baseline this model asserts over SSH.
  */
-export const CiscoIosGlobalArgsSchema = z.object({
-  host: HostSchema.optional().describe(
+/**
+ * The connection a SINGLE-TARGET METHOD is handed, per call.
+ *
+ * ⚠️ THIS EXISTS BECAUSE `globalArguments` CANNOT BE SUPPLIED PER STEP. They are
+ * set on the model INSTANCE, one value for every caller, and 173 of this lab's
+ * 174 committed instances set none. Every field below used to live there, so no
+ * run could aim these methods at a switch or choose their credential.
+ *
+ * `hostKeyPolicy` and `legacyAlgorithms` are REQUIRED with no default. Both are
+ * per-DEVICE facts -- a security posture and a firmware-age workaround -- and
+ * both come from the device or platform record. `legacyAlgorithms` defaulted to
+ * TRUE here, which silently offered legacy SSH kex and ciphers to every switch
+ * including ones that do not need them.
+ *
+ * The credential comes from the STEP through `vault.get(...)`, the sanctioned
+ * path in this lab.
+ */
+export const CiscoIosConnectionSchema = z.object({
+  host: HostSchema.describe(
     "Management IP or hostname of the switch. Omit on a bare fleet instance — discoverFleet supplies it per target.",
   ),
   port: z.number().int().min(1).max(65535).default(22).describe("SSH port"),
@@ -189,32 +206,86 @@ export const CiscoIosGlobalArgsSchema = z.object({
   ).optional().describe(
     "SSH username (a privilege-15 local user). Omit on a bare fleet instance.",
   ),
-  password: VaultValueSchema.optional().meta({ sensitive: true }).describe(
+  password: VaultValueSchema.meta({ sensitive: true }).describe(
     "SSH password. Use: ${{ vault.get(your-vault, <switch>-admin) }}. Omit on a bare fleet instance.",
   ),
   enableSecret: VaultValueSchema.optional().meta({ sensitive: true }).describe(
     "Enable secret. Set ONLY if the login does not land in privileged EXEC; sends 'enable' + this secret. Leave unset for a privilege-15 login.",
   ),
-  hostname: CiscoHostnameSchema.optional().describe(
-    "Hostname asserted by applyBaseline (does not rename the SSH target).",
-  ),
-  domainName: DomainNameSchema.optional().describe(
-    "IP domain-name asserted by applyBaseline.",
-  ),
-  hostKeyPolicy: z.enum(["strict", "insecure"]).default("insecure").describe(
+  hostKeyPolicy: z.enum(["strict", "insecure"]).describe(
     "Host-key verification policy. Use strict whenever a trusted known_hosts entry is available; insecure is an explicit compatibility opt-out.",
   ),
-  legacyAlgorithms: z.boolean().default(true).describe(
+  legacyAlgorithms: z.boolean().describe(
     "Append legacy SSH kex/cipher/host-key algorithms to the offer for old IOS images.",
   ),
   commandTimeoutMs: z.number().int().min(1000).max(300_000).default(20_000)
     .describe(
       "SSH connect timeout (seconds, rounded up) and the per-session output read budget, in milliseconds.",
     ),
+});
+
+export type CiscoIosConnection = z.infer<typeof CiscoIosConnectionSchema>;
+export type CiscoIosBaseline = z.infer<typeof CiscoIosBaselineSchema>;
+export type CiscoIosSnmpPayload = z.infer<typeof CiscoIosSnmpPayloadSchema>;
+export type CiscoIosRoutingPayload = z.infer<
+  typeof CiscoIosRoutingPayloadSchema
+>;
+
+/**
+ * The INTENT a mutating method applies. NOT settings, and not instance policy.
+ *
+ * ⚠️ THESE ARE MUTATION PAYLOADS AND THEY WERE IN `globalArguments`. `routing`
+ * is the VLAN and SVI configuration `pushRouting` writes onto the switch;
+ * `snmp` is the SNMPv2c configuration `pushSnmp` writes; `hostname` and
+ * `domainName` are what `applyBaseline` asserts. `pushRouting` threw outright
+ * when its payload was absent.
+ *
+ * They are the most per-RUN things this model has -- they are what a run is FOR
+ * -- and holding them on the instance meant a device's intended layer-3 config
+ * lived in a committed file, could not vary between two switches in one
+ * workflow, and made a config change a source edit.
+ *
+ * ⚠️ AND THE SNMP PAYLOAD CARRIES A CREDENTIAL. Its communities are secrets;
+ * both fields already document the `vault.get(...)` form and are marked
+ * sensitive. On the instance they would have had to be written into a committed
+ * model definition, which the credentials law forbids outright.
+ */
+export const CiscoIosBaselineSchema = z.object({
+  hostname: CiscoHostnameSchema.optional().describe(
+    "Hostname asserted by applyBaseline (does not rename the SSH target).",
+  ),
+  domainName: DomainNameSchema.optional().describe(
+    "IP domain-name asserted by applyBaseline.",
+  ),
+});
+
+export const CiscoIosSnmpPayloadSchema = z.object({
   snmp: SnmpSchema.optional().describe("SNMPv2c configuration (pushSnmp)"),
+});
+
+export const CiscoIosRoutingPayloadSchema = z.object({
   routing: RoutingSchema.optional().describe(
     "Layer-3 / VLAN configuration (pushRouting)",
   ),
+});
+
+/**
+ * What the model INSTANCE holds -- now only what the pre-flight CHECK reads.
+ *
+ * A check's `execute` receives `globalArgs` and NOT a method's arguments, per
+ * the swamp model API reference, "CheckDefinition API" -> "MethodContext Fields
+ * Available in Checks". So a check's subject is instance-level by construction,
+ * which is a different question from which switch a method is aimed at.
+ */
+export const CiscoIosGlobalArgsSchema = z.object({
+  host: HostSchema.optional().describe(
+    "Management IP or hostname, for the switch-reachable pre-flight check only. Omit on a bare fleet instance; the check then reports it cannot probe.",
+  ),
+  port: z.number().int().min(1).max(65535).default(22).describe(
+    "SSH port for the pre-flight probe.",
+  ),
+  commandTimeoutMs: z.number().int().min(1000).max(300_000).default(20_000)
+    .describe("Probe budget in milliseconds, clamped by the check itself."),
 });
 
 export type CiscoIosGlobalArgs = z.infer<typeof CiscoIosGlobalArgsSchema>;
@@ -320,7 +391,7 @@ function legacyAlgoFlags(): string[] {
 
 /** Build the OpenSSH argv without placing credentials on the command line. */
 export function buildSshArgs(
-  args: CiscoIosGlobalArgs,
+  args: CiscoIosConnection,
   connectSecs: number,
 ): string[] {
   const sshArgs = [
@@ -376,7 +447,7 @@ function buildScript(plan: IosPlan): string[] {
  * EXEC output.
  */
 export async function runIosSession(
-  args: CiscoIosGlobalArgs,
+  args: CiscoIosConnection,
   plan: IosPlan,
   spawn: IosSpawn = spawnDenoCommand,
 ): Promise<IosResult> {
@@ -601,21 +672,32 @@ function findExecCommandError(output: string): string | null {
   return null;
 }
 
+/**
+ * Scrub every secret this session could have carried out of a message.
+ *
+ * ⚠️ THE SNMP COMMUNITIES ARE PASSED SEPARATELY NOW, AND THEY MUST STILL BE
+ * PASSED. They used to arrive inside the connection because the whole SNMP
+ * payload lived in `globalArguments`; moving it to a method argument (2026-09-05)
+ * split them off, and simply dropping them here would have quietly stopped
+ * redacting two credentials from stored error text -- a silent regression in the
+ * one direction nobody checks. Every caller that HAS the payload passes it.
+ */
 function redactKnownSecrets(
   value: string,
-  args: CiscoIosGlobalArgs,
+  args: CiscoIosConnection,
+  snmp?: CiscoIosSnmpPayload["snmp"],
 ): string {
   return redactValues(value, [
     args.password ?? "",
     args.enableSecret ?? "",
-    args.snmp?.readOnly ?? "",
-    args.snmp?.readWrite ?? "",
+    snmp?.readOnly ?? "",
+    snmp?.readWrite ?? "",
   ]);
 }
 
 function redactTransportSecrets(
   value: string,
-  args: CiscoIosGlobalArgs,
+  args: CiscoIosConnection,
 ): string {
   return redactValues(value, [args.password ?? "", args.enableSecret ?? ""]);
 }

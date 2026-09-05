@@ -2,8 +2,16 @@ import { z } from "npm:zod@4.3.6";
 import {
   type CiscoFleetTarget,
   CiscoFleetTargetSchema,
+  type CiscoIosBaseline,
+  CiscoIosBaselineSchema,
+  type CiscoIosConnection,
+  CiscoIosConnectionSchema,
   type CiscoIosGlobalArgs,
   CiscoIosGlobalArgsSchema,
+  type CiscoIosRoutingPayload,
+  CiscoIosRoutingPayloadSchema,
+  type CiscoIosSnmpPayload,
+  CiscoIosSnmpPayloadSchema,
   findIosError,
   runIosSession,
 } from "./_ssh.ts";
@@ -153,25 +161,13 @@ export function upgradeGlobalArguments(
   return upgraded;
 }
 
-/**
- * Narrow globalArgs to a fully-configured connection ahead of a
- * single-target method. Bare fleet instances (globalArguments: {})
- * intentionally have no host/username/password — discoverFleet supplies
- * those per target instead.
+/*
+ * `requireGlobalConnection` was here and is GONE (2026-09-05).
+ *
+ * It narrowed `globalArgs` into a usable connection for the five single-target
+ * methods. Those take a `connection` ARGUMENT now, validated before any code
+ * runs, so the guard has nothing left to guard.
  */
-export function requireGlobalConnection(
-  g: CiscoIosGlobalArgs,
-): asserts g is CiscoIosGlobalArgs & {
-  host: string;
-  username: string;
-  password: string;
-} {
-  if (!g.host || !g.username || !g.password) {
-    throw new Error(
-      "This model instance has no host/username/password in globalArguments — single-target methods require a per-device instance (see discoverFleet for bare fleet instances).",
-    );
-  }
-}
 
 /**
  * `@dougschaefer/cisco-ios-switch` model — manages a Cisco IOS switch
@@ -307,16 +303,19 @@ export function createCiscoIosModel(
         description:
           "Capture 'show running-config' and 'show version'; store the config file and parsed device facts. Read-only.",
         arguments: z.object({
+          // The connection is a METHOD argument, not globalArgs, since 2026-09-05:
+          // globalArguments cannot be supplied per step, so these methods could not
+          // be aimed at any switch or given a credential.
+          connection: CiscoIosConnectionSchema,
           redactSecrets: z.boolean().default(true).describe(
             "Strip community strings, secrets, and password lines before storing the config file.",
           ),
         }),
         execute: async (
-          args: { redactSecrets: boolean },
+          args: { redactSecrets: boolean; connection: CiscoIosConnection },
           context: MethodContext,
         ) => {
-          const g = context.globalArgs;
-          requireGlobalConnection(g);
+          const g = args.connection;
           context.logger.info("Capturing running-config from {host}", {
             host: g.host,
           });
@@ -366,6 +365,10 @@ export function createCiscoIosModel(
         description:
           "Run validated single-line show commands and capture their output with known configuration secrets redacted by default. Newlines, semicolons, non-show commands, and device-storage redirection are rejected.",
         arguments: z.object({
+          // The connection is a METHOD argument, not globalArgs, since 2026-09-05:
+          // globalArguments cannot be supplied per step, so these methods could not
+          // be aimed at any switch or given a credential.
+          connection: CiscoIosConnectionSchema,
           commands: z.array(ReadOnlyCommandSchema).min(1).max(100).describe(
             "Read-only show commands to run",
           ),
@@ -374,11 +377,14 @@ export function createCiscoIosModel(
           ),
         }),
         execute: async (
-          args: { commands: string[]; redactSecrets: boolean },
+          args: {
+            commands: string[];
+            redactSecrets: boolean;
+            connection: CiscoIosConnection;
+          },
           context: MethodContext,
         ) => {
-          const g = context.globalArgs;
-          requireGlobalConnection(g);
+          const g = args.connection;
           context.logger.info("Running {count} command(s) on {host}", {
             count: args.commands.length,
             host: g.host,
@@ -415,13 +421,17 @@ export function createCiscoIosModel(
       getMacTable: {
         description:
           "Read `show mac address-table` and return it parsed, with every MAC normalized to the colon-separated LOWERCASE form of the inventory DB's canonical mac_address table (measured 249/249 rows; note lldp_neighbor.remote_chassis_mac is UPPERCASE, so a caller joining against THAT table must fold the case itself -- there is no single DB-wide MAC form). Read-only. This is the OUT-OF-BAND LIVENESS WITNESS: a DYNAMIC entry proves the device behind that MAC is powered and transmitting, established from the switch without touching the device at all -- so it still answers when the device's own management address does not. That distinction is the point. An address that does not respond is indistinguishable from a dead device UNTIL you have this: on 2026-08-21 an iDRAC was diagnosed as dead when it had merely moved VLAN, and its MAC was being learned dynamically on the OOB switch port the entire time. Entry TYPE is returned rather than reduced to a boolean, because only DYNAMIC proves current transmission -- STATIC is configuration and the CPU rows are the switch describing itself; counting either as liveness would manufacture evidence. This method reports the table and draws NO conclusion about any device.",
-        arguments: z.object({}),
+        arguments: z.object({
+          // The connection is a METHOD argument, not globalArgs, since 2026-09-05.
+          // This method also had an EMPTY schema, which drops every input silently —
+          // the shape that made a napalm caller's five inputs vanish.
+          connection: CiscoIosConnectionSchema,
+        }),
         execute: async (
-          _args: Record<string, never>,
+          args: { connection: CiscoIosConnection },
           context: MethodContext,
         ) => {
-          const g = context.globalArgs;
-          requireGlobalConnection(g);
+          const g = args.connection;
           context.logger.info("Reading MAC address-table from {host}", {
             host: g.host,
           });
@@ -454,15 +464,30 @@ export function createCiscoIosModel(
         description:
           "Assert idempotent secure-access hardening: hostname/domain, service password-encryption, HTTP off, console + VTY login/timeout, SSH-only transport. Saves to startup.",
         arguments: z.object({
+          // The connection is a METHOD argument, not globalArgs, since 2026-09-05:
+          // globalArguments cannot be supplied per step, so these methods could not
+          // be aimed at any switch or given a credential.
+          connection: CiscoIosConnectionSchema,
+          ...CiscoIosBaselineSchema.shape,
           dryRun: z.boolean().describe(
             "Required safety choice: true renders without connecting; false applies and saves on the switch.",
           ),
         }),
-        execute: async (args: { dryRun: boolean }, context: MethodContext) => {
-          const g = context.globalArgs;
-          requireGlobalConnection(g);
+        execute: async (
+          args: {
+            dryRun: boolean;
+            connection: CiscoIosConnection;
+            hostname?: CiscoIosBaseline["hostname"];
+            domainName?: CiscoIosBaseline["domainName"];
+          },
+          context: MethodContext,
+        ) => {
+          const g = args.connection;
           logMutationEntry(context, "applyBaseline", args.dryRun);
-          const lines = baselineLines(g);
+          const lines = baselineLines({
+            hostname: args.hostname,
+            domainName: args.domainName,
+          });
           return await applyConfig(
             context,
             "applyBaseline",
@@ -470,6 +495,7 @@ export function createCiscoIosModel(
             args.dryRun,
             false,
             dependencies,
+            g,
           );
         },
       },
@@ -478,20 +504,31 @@ export function createCiscoIosModel(
         description:
           "Configure SNMPv2c read-only/read-write communities, location, contact, and optional trap host from globalArguments.snmp. Saves to startup.",
         arguments: z.object({
+          // The connection is a METHOD argument, not globalArgs, since 2026-09-05:
+          // globalArguments cannot be supplied per step, so these methods could not
+          // be aimed at any switch or given a credential.
+          connection: CiscoIosConnectionSchema,
+          ...CiscoIosSnmpPayloadSchema.shape,
           dryRun: z.boolean().describe(
             "Required safety choice: true renders without connecting; false applies and saves on the switch.",
           ),
         }),
-        execute: async (args: { dryRun: boolean }, context: MethodContext) => {
-          const g = context.globalArgs;
-          requireGlobalConnection(g);
+        execute: async (
+          args: {
+            dryRun: boolean;
+            connection: CiscoIosConnection;
+            snmp: CiscoIosSnmpPayload["snmp"];
+          },
+          context: MethodContext,
+        ) => {
+          const g = args.connection;
           logMutationEntry(context, "pushSnmp", args.dryRun);
-          if (!g.snmp || (!g.snmp.readOnly && !g.snmp.readWrite)) {
+          if (!args.snmp || (!args.snmp.readOnly && !args.snmp.readWrite)) {
             throw new Error(
-              "globalArguments.snmp must define at least one of readOnly / readWrite",
+              "the snmp argument must define at least one of readOnly / readWrite",
             );
           }
-          const lines = snmpLines(g);
+          const lines = snmpLines({ snmp: args.snmp });
           // Redact community strings from the stored record (secrets).
           return await applyConfig(
             context,
@@ -500,6 +537,7 @@ export function createCiscoIosModel(
             args.dryRun,
             true,
             dependencies,
+            g,
           );
         },
       },
@@ -508,24 +546,31 @@ export function createCiscoIosModel(
         description:
           "Apply Layer-3 intent from globalArguments.routing: ip routing, VLANs/SVIs, default route, and access-port assignments. Saves to startup.",
         arguments: z.object({
+          // The connection is a METHOD argument, not globalArgs, since 2026-09-05:
+          // globalArguments cannot be supplied per step, so these methods could not
+          // be aimed at any switch or given a credential.
+          connection: CiscoIosConnectionSchema,
+          ...CiscoIosRoutingPayloadSchema.shape,
           dryRun: z.boolean().describe(
             "Required safety choice: true renders without connecting; false applies and saves on the switch.",
           ),
         }),
-        execute: async (args: { dryRun: boolean }, context: MethodContext) => {
-          const g = context.globalArgs;
-          requireGlobalConnection(g);
+        execute: async (
+          args: {
+            dryRun: boolean;
+            connection: CiscoIosConnection;
+            routing: CiscoIosRoutingPayload["routing"];
+          },
+          context: MethodContext,
+        ) => {
+          const g = args.connection;
           logMutationEntry(context, "pushRouting", args.dryRun);
-          if (!g.routing) {
-            throw new Error(
-              "globalArguments.routing is required for pushRouting",
-            );
+          if (!args.routing) {
+            throw new Error("the routing argument is required for pushRouting");
           }
-          const lines = routingLines(g);
+          const lines = routingLines({ routing: args.routing });
           if (lines.length === 0) {
-            throw new Error(
-              "globalArguments.routing produced no configuration",
-            );
+            throw new Error("the routing argument produced no configuration");
           }
           return await applyConfig(
             context,
@@ -534,6 +579,7 @@ export function createCiscoIosModel(
             args.dryRun,
             false,
             dependencies,
+            g,
           );
         },
       },
@@ -560,7 +606,7 @@ export function createCiscoIosModel(
                 target.port,
                 Math.max(3000, Math.min(target.commandTimeoutMs, 10000)),
               );
-              const sessionArgs: CiscoIosGlobalArgs = {
+              const sessionArgs: CiscoIosConnection = {
                 host: target.host,
                 port: target.port,
                 username: target.username,
@@ -785,8 +831,13 @@ async function applyConfig(
   dryRun: boolean,
   redactStored: boolean,
   dependencies: CiscoIosModelDependencies,
+  // ⚠️ PASSED IN, not read from `context.globalArgs`. This helper is the one
+  // place every mutating method reaches the switch, and it was reading the
+  // connection from the instance -- which no run can set. Taking it as a
+  // parameter is what makes the three push methods actually aimable.
+  connection: CiscoIosConnection,
 ): Promise<{ dataHandles: DataHandle[] }> {
-  const g = context.globalArgs;
+  const g = connection;
   const storedLines = redactStored ? lines.map(redactLine) : lines;
   if (dryRun) {
     const handle = await context.writeResource(

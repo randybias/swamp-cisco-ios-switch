@@ -1,3 +1,4 @@
+import { z } from "npm:zod@4.3.6";
 import {
   assert,
   assertEquals,
@@ -17,8 +18,12 @@ import {
 } from "./_config.ts";
 import {
   buildSshArgs,
-  type CiscoIosGlobalArgs,
+  CiscoIosBaselineSchema,
+  type CiscoIosConnection,
+  CiscoIosConnectionSchema,
   CiscoIosGlobalArgsSchema,
+  CiscoIosRoutingPayloadSchema,
+  CiscoIosSnmpPayloadSchema,
   findIosError,
   type IosSpawn,
   runIosSession,
@@ -46,21 +51,43 @@ const runningConfig = [
   " ip address 192.0.2.10 255.255.255.0",
 ].join("\n");
 
-const globalArgs = CiscoIosGlobalArgsSchema.parse({
+// ⚠️ SPLIT 2026-09-05, because the one object this used to be is now three.
+// It served as the instance's globalArguments, the SSH connection AND the
+// mutation payloads at once -- the exact conflation that put a credential, a
+// security posture and a device's intended layer-3 config in the one place no
+// run could set them.
+const instanceArgs = CiscoIosGlobalArgsSchema.parse({
+  host: "switch.example.test",
+  port: 22,
+  commandTimeoutMs: 20_000,
+});
+
+const sshConnection = CiscoIosConnectionSchema.parse({
   host: "switch.example.test",
   port: 22,
   username: "automation",
   password: "synthetic-password",
-  hostname: "switch-test-1",
-  domainName: "example.test",
   hostKeyPolicy: "strict",
   legacyAlgorithms: false,
   commandTimeoutMs: 20_000,
-}) as CiscoIosGlobalArgs & { host: string; username: string; password: string };
+});
 
-/** Build validated global args for line-generator and model tests. */
-function args(partial: Partial<CiscoIosGlobalArgs>): CiscoIosGlobalArgs {
-  return CiscoIosGlobalArgsSchema.parse({ ...globalArgs, ...partial });
+/** Build a validated CONNECTION for line-generator and model tests. */
+function args(partial: Partial<CiscoIosConnection>): CiscoIosConnection {
+  return CiscoIosConnectionSchema.parse({ ...sshConnection, ...partial });
+}
+
+/** Build a validated PAYLOAD. These were one object with the connection before. */
+function snmpArgs(snmp: unknown) {
+  return CiscoIosSnmpPayloadSchema.parse({ snmp });
+}
+
+function routingArgs(routing: unknown) {
+  return CiscoIosRoutingPayloadSchema.parse({ routing });
+}
+
+function baselineArgs(payload: unknown) {
+  return CiscoIosBaselineSchema.parse(payload);
 }
 
 function commandOutput(
@@ -142,16 +169,16 @@ function successfulTranscript(command = "show clock", output = "09:30:00 UTC") {
 }
 
 Deno.test("global schema accepts explicit secure transport facts", () => {
-  assertEquals(globalArgs.hostKeyPolicy, "strict");
-  assertEquals(globalArgs.legacyAlgorithms, false);
-  assertEquals(globalArgs.port, 22);
-  assertEquals(globalArgs.commandTimeoutMs, 20_000);
-  assertEquals(CiscoIosGlobalArgsSchema.shape.password.meta()?.sensitive, true);
+  assertEquals(sshConnection.hostKeyPolicy, "strict");
+  assertEquals(sshConnection.legacyAlgorithms, false);
+  assertEquals(sshConnection.port, 22);
+  assertEquals(sshConnection.commandTimeoutMs, 20_000);
+  assertEquals(CiscoIosConnectionSchema.shape.password.meta()?.sensitive, true);
   assertEquals(
-    CiscoIosGlobalArgsSchema.shape.enableSecret.meta()?.sensitive,
+    CiscoIosConnectionSchema.shape.enableSecret.meta()?.sensitive,
     true,
   );
-  const snmpSchema = CiscoIosGlobalArgsSchema.shape.snmp.unwrap();
+  const snmpSchema = CiscoIosSnmpPayloadSchema.shape.snmp.unwrap();
   assertEquals(snmpSchema.shape.readOnly.meta()?.sensitive, true);
   assertEquals(snmpSchema.shape.readWrite.meta()?.sensitive, true);
 });
@@ -160,29 +187,40 @@ Deno.test("global arguments validate as fully empty (bare fleet instance)", () =
   const parsed = CiscoIosGlobalArgsSchema.parse({});
   assertEquals(parsed.port, 22);
   assertEquals(parsed.commandTimeoutMs, 20_000);
-  assertEquals(parsed.hostKeyPolicy, "insecure");
-  assertEquals(parsed.legacyAlgorithms, true);
+  // ⚠️ THESE TWO ARE GONE FROM THIS SCHEMA, not merely absent (2026-09-05). They
+  // are per-DEVICE facts and moved to the connection argument, where both are
+  // REQUIRED with no default. legacyAlgorithms defaulted to TRUE here, which
+  // silently offered legacy SSH kex and ciphers to every switch. Pinned BY NAME
+  // so re-adding one is a failing test rather than a quiet regression.
+  assertEquals(
+    Object.keys(CiscoIosGlobalArgsSchema.shape).sort(),
+    ["commandTimeoutMs", "host", "port"],
+  );
   assertEquals(parsed.host, undefined);
 });
 
-Deno.test("getRunningConfig rejects a bare instance with no host/username/password", async () => {
+Deno.test("getRunningConfig REFUSES a call with no connection — by the SCHEMA, not a guard", () => {
+  // ⚠️ REPLACES "getRunningConfig rejects a bare instance with no
+  // host/username/password". That premise is gone: the method no longer reads
+  // globalArgs, so there is no bare instance to reject. The refusal now lands at
+  // argument validation, before any code runs, and it is stronger — the schema
+  // also enforces the required host-key policy and legacy-algorithms flag, which
+  // the old guard never looked at.
   const testModel = createCiscoIosModel();
-  const harness = createModelTestContext({
-    globalArgs: CiscoIosGlobalArgsSchema.parse({}),
-    methodName: "getRunningConfig",
+  assertThrows(() => testModel.methods.getRunningConfig.arguments.parse({}));
+  // POSITIVE CONTROL: with a connection it parses, so the refusal is about the
+  // missing connection rather than the schema refusing everything.
+  testModel.methods.getRunningConfig.arguments.parse({
+    connection: sshConnection,
   });
-  await assertRejects(
-    () =>
-      testModel.methods.getRunningConfig.execute(
-        testModel.methods.getRunningConfig.arguments.parse({}),
-        harness.context as never,
-      ),
-    Error,
-    "no host/username/password",
-  );
 });
 
-Deno.test("global schema rejects malformed targets, credentials, and timeouts", () => {
+Deno.test("the CONNECTION schema rejects malformed targets, credentials, and timeouts", () => {
+  // ⚠️ SPLIT FROM ONE TEST 2026-09-05. These overrides were checked against the
+  // global schema, which now holds only three fields — and a zod object STRIPS
+  // what it does not declare, so every one of these would have parsed clean
+  // against it and the test would have asserted nothing. Each override is now
+  // checked against the schema that actually owns the field.
   for (
     const overrides of [
       { host: "-oProxyCommand=synthetic" },
@@ -190,8 +228,6 @@ Deno.test("global schema rejects malformed targets, credentials, and timeouts", 
       { username: "automation@unexpected" },
       { password: "synthetic\nshow running-config" },
       { enableSecret: "synthetic\nconfigure terminal" },
-      { hostname: "switch\nreload" },
-      { domainName: "bad domain.example" },
       { port: 0 },
       { port: 65_536 },
       { commandTimeoutMs: 999 },
@@ -199,11 +235,32 @@ Deno.test("global schema rejects malformed targets, credentials, and timeouts", 
     ]
   ) {
     assertEquals(
-      CiscoIosGlobalArgsSchema.safeParse({ ...globalArgs, ...overrides })
+      CiscoIosConnectionSchema.safeParse({ ...sshConnection, ...overrides })
         .success,
       false,
     );
   }
+  // POSITIVE CONTROL: the unmodified connection parses, so each refusal above is
+  // about its override and not about the schema refusing everything.
+  assertEquals(CiscoIosConnectionSchema.safeParse(sshConnection).success, true);
+});
+
+Deno.test("the BASELINE payload schema rejects malformed identity intent", () => {
+  for (
+    const overrides of [
+      { hostname: "switch\nreload" },
+      { domainName: "bad domain.example" },
+    ]
+  ) {
+    assertEquals(CiscoIosBaselineSchema.safeParse(overrides).success, false);
+  }
+  assertEquals(
+    CiscoIosBaselineSchema.safeParse({
+      hostname: "switch-test-1",
+      domainName: "example.test",
+    }).success,
+    true,
+  );
 });
 
 Deno.test("nested configuration schemas reject command injection and inconsistent intent", () => {
@@ -267,12 +324,31 @@ Deno.test("nested configuration schemas reject command injection and inconsisten
       },
     },
   ];
+  // ⚠️ EACH VARIANT GOES TO THE SCHEMA THAT OWNS IT. These were checked against
+  // the global schema, which no longer declares snmp or routing — and a zod
+  // object STRIPS what it does not declare, so every injection variant here
+  // would have parsed CLEAN and this test would have asserted nothing while
+  // still passing. That is the failure mode worth naming: a moved field turns a
+  // security test into a no-op silently.
   for (const variant of variants) {
-    assertEquals(
-      CiscoIosGlobalArgsSchema.safeParse({ ...globalArgs, ...variant }).success,
-      false,
-    );
+    const schema = "snmp" in variant
+      ? CiscoIosSnmpPayloadSchema
+      : CiscoIosRoutingPayloadSchema;
+    assertEquals(schema.safeParse(variant).success, false);
   }
+  // POSITIVE CONTROL: a well-formed payload of each kind parses, so the refusals
+  // above are about the injected content and not about the schema refusing all.
+  assertEquals(
+    CiscoIosSnmpPayloadSchema.safeParse({ snmp: { readOnly: "safe-ro" } })
+      .success,
+    true,
+  );
+  assertEquals(
+    CiscoIosRoutingPayloadSchema.safeParse({
+      routing: { enabled: false, vlans: [], accessPorts: [] },
+    }).success,
+    true,
+  );
 });
 
 Deno.test("published-definition upgrade preserves old behavior and fills nested defaults", () => {
@@ -314,7 +390,7 @@ Deno.test("published-definition upgrade preserves old behavior and fills nested 
 });
 
 Deno.test("baselineLines includes hostname/domain when set and SSH-only VTY", () => {
-  const lines = baselineLines(args({
+  const lines = baselineLines(baselineArgs({
     hostname: "switch-test-1",
     domainName: "example.test",
   }));
@@ -327,7 +403,7 @@ Deno.test("baselineLines includes hostname/domain when set and SSH-only VTY", ()
 
 Deno.test("baselineLines omits hostname/domain when unset", () => {
   const lines = baselineLines(
-    args({ hostname: undefined, domainName: undefined }),
+    baselineArgs({ hostname: undefined, domainName: undefined }),
   );
   assert(!lines.some((line) => line.startsWith("hostname ")));
   assert(!lines.some((line) => line.startsWith("ip domain-name ")));
@@ -335,14 +411,12 @@ Deno.test("baselineLines omits hostname/domain when unset", () => {
 });
 
 Deno.test("snmpLines emits validated RO/RW identity and trap intent", () => {
-  const lines = snmpLines(args({
-    snmp: {
-      readOnly: "synthetic-ro",
-      readWrite: "synthetic-rw",
-      location: "Test Lab",
-      contact: "noc@example.test",
-      trapHost: "192.0.2.50",
-    },
+  const lines = snmpLines(snmpArgs({
+    readOnly: "synthetic-ro",
+    readWrite: "synthetic-rw",
+    location: "Test Lab",
+    contact: "noc@example.test",
+    trapHost: "192.0.2.50",
   }));
   assertEquals(lines, [
     "snmp-server community synthetic-ro RO",
@@ -355,26 +429,24 @@ Deno.test("snmpLines emits validated RO/RW identity and trap intent", () => {
 });
 
 Deno.test("routingLines builds VLANs, SVI, route, and access ports", () => {
-  const lines = routingLines(args({
-    routing: {
-      enabled: true,
-      defaultRouteNextHop: "192.0.2.1",
-      vlans: [
-        {
-          id: 20,
-          name: "USER",
-          sviIp: "198.51.100.1",
-          sviMask: "255.255.255.0",
-        },
-        { id: 30, name: "AV" },
-      ],
-      accessPorts: [{
-        range: "gigabitEthernet 1/0/1 - 12",
-        vlanId: 20,
-        description: "Users",
-        portfast: true,
-      }],
-    },
+  const lines = routingLines(routingArgs({
+    enabled: true,
+    defaultRouteNextHop: "192.0.2.1",
+    vlans: [
+      {
+        id: 20,
+        name: "USER",
+        sviIp: "198.51.100.1",
+        sviMask: "255.255.255.0",
+      },
+      { id: 30, name: "AV" },
+    ],
+    accessPorts: [{
+      range: "gigabitEthernet 1/0/1 - 12",
+      vlanId: 20,
+      description: "Users",
+      portfast: true,
+    }],
   }));
   assertEquals(lines[0], "ip routing");
   assert(lines.includes("interface vlan 20"));
@@ -388,17 +460,15 @@ Deno.test("routingLines builds VLANs, SVI, route, and access ports", () => {
 });
 
 Deno.test("routingLines supports explicit L2-only intent without portfast", () => {
-  const lines = routingLines(args({
-    routing: {
-      enabled: false,
-      vlans: [{ id: 40, name: "MGMT" }],
-      accessPorts: [{
-        range: "fastEthernet 0/1",
-        vlanId: 40,
-        description: "",
-        portfast: false,
-      }],
-    },
+  const lines = routingLines(routingArgs({
+    enabled: false,
+    vlans: [{ id: 40, name: "MGMT" }],
+    accessPorts: [{
+      range: "fastEthernet 0/1",
+      vlanId: 40,
+      description: "",
+      portfast: false,
+    }],
   }));
   assert(!lines.includes("ip routing"));
   assert(!lines.some((line) => line.startsWith("ip route ")));
@@ -521,7 +591,7 @@ Deno.test("read-only output may contain non-error percent-prefixed text", async 
     "% Authorized operators only\nhostname switch-test-1",
   );
   const result = await runIosSession(
-    globalArgs,
+    sshConnection,
     { execCommands: ["show running-config"] },
     fakeSpawn(commandOutput(transcript), {}),
   );
@@ -529,12 +599,16 @@ Deno.test("read-only output may contain non-error percent-prefixed text", async 
 });
 
 Deno.test("transport always scrubs login secrets but leaves device redaction to the method", async () => {
-  const sessionArgs = args({ snmp: { readOnly: "synthetic-community" } });
+  // The transport takes the CONNECTION only. It used to be handed one object
+  // carrying the SNMP payload as well, which is why this test could pass a
+  // community through it; the community is now a literal in the transcript,
+  // which is what the assertion was always really about.
+  const sessionArgs = sshConnection;
   const transcript = successfulTranscript(
     "show running-config",
     [
       "snmp-server community synthetic-community RO",
-      `banner motd ${globalArgs.password}`,
+      `banner motd ${sshConnection.password}`,
     ].join("\n"),
   );
   const result = await runIosSession(
@@ -543,11 +617,12 @@ Deno.test("transport always scrubs login secrets but leaves device redaction to 
     fakeSpawn(commandOutput(transcript), {}),
   );
   assert(result.execOutputs[0].output.includes("synthetic-community"));
-  assert(!result.execOutputs[0].output.includes(globalArgs.password));
+  assert(!result.execOutputs[0].output.includes(sshConnection.password));
 });
 
 Deno.test("runCommands accepts trimmed show commands and rejects mutation/chaining", () => {
   const parsed = model.methods.runCommands.arguments.parse({
+    connection: sshConnection,
     commands: [" show version ", "SHOW ip route"],
   });
   assertEquals(parsed.commands, ["show version", "SHOW ip route"]);
@@ -568,28 +643,42 @@ Deno.test("runCommands accepts trimmed show commands and rejects mutation/chaini
     ]
   ) {
     assertThrows(
-      () => model.methods.runCommands.arguments.parse({ commands: [command] }),
+      () =>
+        model.methods.runCommands.arguments.parse({
+          connection: sshConnection,
+          commands: [command],
+        }),
       Error,
       "single read-only show command",
     );
   }
 });
 
-Deno.test("mutating methods require an explicit dry-run choice", () => {
+Deno.test("mutating methods require an explicit dry-run choice AND a connection", () => {
   for (const method of ["applyBaseline", "pushSnmp", "pushRouting"] as const) {
     assertThrows(() => model.methods[method].arguments.parse({}));
-    assertEquals(model.methods[method].arguments.parse({ dryRun: true }), {
+    // ⚠️ A DRY-RUN CHOICE ALONE IS NO LONGER ENOUGH. This asserted that
+    // `{ dryRun: true }` parsed to exactly itself, which was true only because
+    // everything else these methods needed lived in globalArguments, where no
+    // run could supply it. The connection is a required argument now, so the
+    // same call is REFUSED, and that is the guarantee worth pinning.
+    assertThrows(() => model.methods[method].arguments.parse({ dryRun: true }));
+    // POSITIVE CONTROL: with a connection it parses, so the refusal above is
+    // about the missing connection rather than the schema refusing everything.
+    const parsed = model.methods[method].arguments.parse({
       dryRun: true,
+      connection: sshConnection,
     });
+    assertEquals(parsed.dryRun, true);
   }
 });
 
 Deno.test("strict SSH argv keeps host verification enabled and secrets absent", () => {
-  const sshArgs = buildSshArgs(globalArgs, 20);
+  const sshArgs = buildSshArgs(sshConnection, 20);
   assert(sshArgs.includes("StrictHostKeyChecking=yes"));
   assert(!sshArgs.includes("StrictHostKeyChecking=no"));
   assert(!sshArgs.includes("UserKnownHostsFile=/dev/null"));
-  assert(!JSON.stringify(sshArgs).includes(globalArgs.password));
+  assert(!JSON.stringify(sshArgs).includes(sshConnection.password));
   assertEquals(sshArgs.at(-2), "--");
   assertEquals(sshArgs.at(-1), "automation@switch.example.test");
 });
@@ -611,7 +700,7 @@ Deno.test("insecure and legacy transport choices are explicit", () => {
 Deno.test("SSH session keeps stdin open until IOS exits and captures output", async () => {
   const capture: Parameters<typeof fakeSpawn>[1] = {};
   const result = await runIosSession(
-    globalArgs,
+    sshConnection,
     { execCommands: ["show clock"] },
     fakeSpawn(commandOutput(successfulTranscript()), capture),
   );
@@ -631,8 +720,12 @@ Deno.test("SSH session keeps stdin open until IOS exits and captures output", as
     capture.askpassScript,
     '#!/bin/sh\ncat "$SWAMP_ASKPASS_PASSWORD_FILE"\n',
   );
-  assert(!JSON.stringify(capture.options?.args).includes(globalArgs.password));
-  assert(!JSON.stringify(capture.options?.env).includes(globalArgs.password));
+  assert(
+    !JSON.stringify(capture.options?.args).includes(sshConnection.password),
+  );
+  assert(
+    !JSON.stringify(capture.options?.env).includes(sshConnection.password),
+  );
   assertEquals(result.execOutputs, [{
     command: "show clock",
     output: "09:30:00 UTC",
@@ -711,7 +804,7 @@ Deno.test("SSH session renders configuration without pre-buffering save", async 
     "",
   ].join("\n");
   await runIosSession(
-    globalArgs,
+    sshConnection,
     { configLines: ["hostname switch-test-2"] },
     fakeSpawn(commandOutput(transcript), capture),
   );
@@ -733,7 +826,7 @@ Deno.test("SSH session rejects empty success and authentication stderr", async (
   await assertRejects(
     () =>
       runIosSession(
-        globalArgs,
+        sshConnection,
         { execCommands: ["show clock"] },
         fakeSpawn(commandOutput(""), {}),
       ),
@@ -743,7 +836,7 @@ Deno.test("SSH session rejects empty success and authentication stderr", async (
   await assertRejects(
     () =>
       runIosSession(
-        globalArgs,
+        sshConnection,
         { execCommands: ["show clock"] },
         fakeSpawn(
           commandOutput(successfulTranscript(), "Permission denied"),
@@ -763,7 +856,7 @@ Deno.test("SSH session represents a command whose echo is absent as empty output
     "",
   ].join("\n");
   const result = await runIosSession(
-    globalArgs,
+    sshConnection,
     { execCommands: ["show clock"] },
     fakeSpawn(commandOutput(transcript), {}),
   );
@@ -774,7 +867,7 @@ Deno.test("SSH session rejects a nonzero exit even with partial stdout", async (
   await assertRejects(
     () =>
       runIosSession(
-        globalArgs,
+        sshConnection,
         { execCommands: ["show clock"] },
         fakeSpawn(
           commandOutput(successfulTranscript(), "connection reset", 255),
@@ -800,7 +893,7 @@ for (
     await assertRejects(
       () =>
         runIosSession(
-          globalArgs,
+          sshConnection,
           { execCommands: ["show clock"] },
           fakeSpawn(commandOutput("", stderr, 255), {}),
         ),
@@ -814,12 +907,12 @@ Deno.test("SSH failure classification never includes raw or overlapping secrets"
   const negotiation = await assertRejects(
     () =>
       runIosSession(
-        globalArgs,
+        sshConnection,
         { execCommands: ["show clock"] },
         fakeSpawn(
           commandOutput(
             "",
-            `no matching key exchange method found: ${globalArgs.password}`,
+            `no matching key exchange method found: ${sshConnection.password}`,
             255,
           ),
           {},
@@ -828,7 +921,7 @@ Deno.test("SSH failure classification never includes raw or overlapping secrets"
     Error,
     "algorithm negotiation failed",
   );
-  assert(!negotiation.message.includes(globalArgs.password));
+  assert(!negotiation.message.includes(sshConnection.password));
 
   const overlappingArgs = args({
     password: "synthetic",
@@ -854,7 +947,7 @@ Deno.test("SSH session rejects IOS command errors returned with exit zero", asyn
   await assertRejects(
     () =>
       runIosSession(
-        globalArgs,
+        sshConnection,
         { execCommands: ["show unsupported"] },
         fakeSpawn(commandOutput(transcript), {}),
       ),
@@ -866,13 +959,13 @@ Deno.test("SSH session rejects IOS command errors returned with exit zero", asyn
 Deno.test("SSH session normalizes and redacts spawn failures", async () => {
   const error = await assertRejects(
     () =>
-      runIosSession(globalArgs, { execCommands: ["show clock"] }, () => {
-        throw `spawn failed with ${globalArgs.password}`;
+      runIosSession(sshConnection, { execCommands: ["show clock"] }, () => {
+        throw `spawn failed with ${sshConnection.password}`;
       }),
     Error,
     "spawn failed with ***",
   );
-  assert(!error.message.includes(globalArgs.password));
+  assert(!error.message.includes(sshConnection.password));
 });
 
 Deno.test("SSH session redacts writer failures and cleans temporary credentials", async () => {
@@ -880,14 +973,14 @@ Deno.test("SSH session redacts writer failures and cleans temporary credentials"
   const error = await assertRejects(
     () =>
       runIosSession(
-        globalArgs,
+        sshConnection,
         { execCommands: ["show clock"] },
         (_cmd, options) => {
           passwordFile = options.env?.SWAMP_ASKPASS_PASSWORD_FILE ?? "";
           return {
             stdin: new WritableStream<Uint8Array>({
               write() {
-                throw new Error(`write failed with ${globalArgs.password}`);
+                throw new Error(`write failed with ${sshConnection.password}`);
               },
             }),
             stdout: byteStream(new Uint8Array()),
@@ -899,7 +992,7 @@ Deno.test("SSH session redacts writer failures and cleans temporary credentials"
     Error,
     "write failed with ***",
   );
-  assert(!error.message.includes(globalArgs.password));
+  assert(!error.message.includes(sshConnection.password));
   await assertRejects(() => Deno.stat(passwordFile));
 });
 
@@ -919,10 +1012,12 @@ Deno.test("getRunningConfig entrypoint writes redacted config and parsed status"
     now: () => new Date("2026-01-10T12:00:00.000Z"),
   });
   const harness = createModelTestContext({
-    globalArgs,
+    globalArgs: instanceArgs,
     methodName: "getRunningConfig",
   });
-  const methodArgs = testModel.methods.getRunningConfig.arguments.parse({});
+  const methodArgs = testModel.methods.getRunningConfig.arguments.parse({
+    connection: sshConnection,
+  });
   const result = await testModel.methods.getRunningConfig.execute(
     methodArgs,
     harness.context as never,
@@ -946,13 +1041,13 @@ Deno.test("getRunningConfig rejects missing requested output before writing", as
     runSession: () => Promise.resolve({ transcript: "", execOutputs: [] }),
   });
   const harness = createModelTestContext({
-    globalArgs,
+    globalArgs: instanceArgs,
     methodName: "getRunningConfig",
   });
   await assertRejects(
     () =>
       testModel.methods.getRunningConfig.execute(
-        { redactSecrets: true },
+        { connection: sshConnection, redactSecrets: true },
         harness.context as never,
       ),
     Error,
@@ -981,10 +1076,11 @@ Deno.test("runCommands entrypoint redacts by default and supports raw opt-out", 
     ]] as const
   ) {
     const harness = createModelTestContext({
-      globalArgs,
+      globalArgs: instanceArgs,
       methodName: "runCommands",
     });
     const methodArgs = testModel.methods.runCommands.arguments.parse({
+      connection: sshConnection,
       commands: [" show running-config "],
       redactSecrets,
     });
@@ -1011,11 +1107,11 @@ Deno.test("applyBaseline dry run writes intent without opening SSH", async () =>
     now: () => new Date("2026-01-10T12:00:00.000Z"),
   });
   const harness = createModelTestContext({
-    globalArgs,
+    globalArgs: instanceArgs,
     methodName: "applyBaseline",
   });
   await testModel.methods.applyBaseline.execute(
-    { dryRun: true },
+    { dryRun: true, connection: sshConnection },
     harness.context as never,
   );
   assertEquals(calls, 0);
@@ -1027,22 +1123,20 @@ Deno.test("applyBaseline dry run writes intent without opening SSH", async () =>
 });
 
 Deno.test("pushSnmp dry run stores only redacted communities", async () => {
-  const snmpArgs = args({
-    snmp: {
-      readOnly: "synthetic-ro",
-      readWrite: "synthetic-rw",
-      location: "Test Lab",
-    },
+  const snmpPayload = snmpArgs({
+    readOnly: "synthetic-ro",
+    readWrite: "synthetic-rw",
+    location: "Test Lab",
   });
   const testModel = createCiscoIosModel({
     runSession: () => Promise.reject(new Error("must not connect")),
   });
   const harness = createModelTestContext({
-    globalArgs: snmpArgs,
+    globalArgs: instanceArgs,
     methodName: "pushSnmp",
   });
   await testModel.methods.pushSnmp.execute(
-    { dryRun: true },
+    { dryRun: true, connection: sshConnection, snmp: snmpPayload.snmp },
     harness.context as never,
   );
   const lines = harness.getWrittenResources()[0].data.appliedLines as string[];
@@ -1053,20 +1147,22 @@ Deno.test("pushSnmp dry run stores only redacted communities", async () => {
 });
 
 Deno.test("pushRouting dry run renders validated routing intent", async () => {
-  const routingArgs = args({
-    routing: {
-      enabled: false,
-      vlans: [{ id: 20, name: "USER" }],
-      accessPorts: [],
-    },
+  const routingPayload = routingArgs({
+    enabled: false,
+    vlans: [{ id: 20, name: "USER" }],
+    accessPorts: [],
   });
   const testModel = createCiscoIosModel();
   const harness = createModelTestContext({
-    globalArgs: routingArgs,
+    globalArgs: instanceArgs,
     methodName: "pushRouting",
   });
   await testModel.methods.pushRouting.execute(
-    { dryRun: true },
+    {
+      dryRun: true,
+      connection: sshConnection,
+      routing: routingPayload.routing,
+    },
     harness.context as never,
   );
   const lines = harness.getWrittenResources()[0].data.appliedLines as string[];
@@ -1094,15 +1190,15 @@ Deno.test("live configuration applies and saves while redacting stored device ou
     },
   });
   const harness = createModelTestContext({
-    globalArgs,
+    globalArgs: instanceArgs,
     methodName: "applyBaseline",
   });
   await testModel.methods.applyBaseline.execute(
-    { dryRun: false },
+    { dryRun: false, connection: sshConnection },
     harness.context as never,
   );
   assertEquals(receivedPlans, [
-    { configLines: baselineLines(globalArgs) },
+    { configLines: baselineLines({}) },
     { execCommands: ["write memory"] },
   ]);
   const [resource] = harness.getWrittenResources();
@@ -1115,20 +1211,18 @@ Deno.test("live configuration applies and saves while redacting stored device ou
 });
 
 for (
-  const [method, methodGlobalArgs, forbidden] of [
+  const [method, methodPayload, forbidden] of [
     [
       "pushSnmp",
-      args({ snmp: { readOnly: "synthetic-live-ro" } }),
+      snmpArgs({ readOnly: "synthetic-live-ro" }),
       "synthetic-live-ro",
     ],
     [
       "pushRouting",
-      args({
-        routing: {
-          enabled: false,
-          vlans: [{ id: 20, name: "USER" }],
-          accessPorts: [],
-        },
+      routingArgs({
+        enabled: false,
+        vlans: [{ id: 20, name: "USER" }],
+        accessPorts: [],
       }),
       "synthetic-password",
     ],
@@ -1157,17 +1251,28 @@ for (
       },
     });
     const harness = createModelTestContext({
-      globalArgs: methodGlobalArgs,
+      globalArgs: instanceArgs,
       methodName: method,
     });
     if (method === "pushSnmp") {
       await testModel.methods.pushSnmp.execute(
-        { dryRun: false },
+        {
+          dryRun: false,
+          connection: sshConnection,
+          snmp:
+            (methodPayload as z.infer<typeof CiscoIosSnmpPayloadSchema>).snmp,
+        },
         harness.context as never,
       );
     } else {
       await testModel.methods.pushRouting.execute(
-        { dryRun: false },
+        {
+          dryRun: false,
+          connection: sshConnection,
+          routing:
+            (methodPayload as z.infer<typeof CiscoIosRoutingPayloadSchema>)
+              .routing,
+        },
         harness.context as never,
       );
     }
@@ -1193,13 +1298,13 @@ Deno.test("live configuration requires a positive save acknowledgement", async (
     },
   });
   const harness = createModelTestContext({
-    globalArgs,
+    globalArgs: instanceArgs,
     methodName: "applyBaseline",
   });
   await assertRejects(
     () =>
       testModel.methods.applyBaseline.execute(
-        { dryRun: false },
+        { dryRun: false, connection: sshConnection },
         harness.context as never,
       ),
     Error,
@@ -1221,13 +1326,13 @@ Deno.test("configuration entrypoints reject missing intent and IOS failures", as
     },
   });
   const baselineHarness = createModelTestContext({
-    globalArgs,
+    globalArgs: instanceArgs,
     methodName: "applyBaseline",
   });
   await assertRejects(
     () =>
       testModel.methods.applyBaseline.execute(
-        { dryRun: false },
+        { dryRun: false, connection: sshConnection },
         baselineHarness.context as never,
       ),
     Error,
@@ -1237,13 +1342,16 @@ Deno.test("configuration entrypoints reject missing intent and IOS failures", as
   assertEquals(baselineHarness.getWrittenResources(), []);
 
   const missingSnmp = createModelTestContext({
-    globalArgs,
+    globalArgs: instanceArgs,
     methodName: "pushSnmp",
   });
   await assertRejects(
     () =>
       testModel.methods.pushSnmp.execute(
-        { dryRun: true },
+        // undefined ON PURPOSE: this test asserts the method REFUSES a missing
+        // payload. It used to omit it from globalArguments; the payload is an
+        // argument now, so absence is expressed here.
+        { dryRun: true, connection: sshConnection, snmp: undefined },
         missingSnmp.context as never,
       ),
     Error,
@@ -1254,25 +1362,32 @@ Deno.test("configuration entrypoints reject missing intent and IOS failures", as
     "Preparing {method} for {host} (dryRun={dryRun})",
   );
   const missingRouting = createModelTestContext({
-    globalArgs,
+    globalArgs: instanceArgs,
     methodName: "pushRouting",
   });
   await assertRejects(
     () =>
       testModel.methods.pushRouting.execute(
-        { dryRun: true },
+        {
+          dryRun: true,
+          connection: sshConnection,
+          // undefined ON PURPOSE, as above: the refusal is what is under test.
+          routing: undefined,
+        },
         missingRouting.context as never,
       ),
     Error,
-    "routing is required",
+    "the routing argument is required",
   );
   assertEquals(
     missingRouting.getLogs()[0]?.message,
     "Preparing {method} for {host} (dryRun={dryRun})",
   );
 
-  const emptyRoutingArgs = args({
-    routing: { enabled: false, vlans: [], accessPorts: [] },
+  const emptyRoutingArgs = routingArgs({
+    enabled: false,
+    vlans: [],
+    accessPorts: [],
   });
   const emptyRouting = createModelTestContext({
     globalArgs: emptyRoutingArgs,
@@ -1281,7 +1396,14 @@ Deno.test("configuration entrypoints reject missing intent and IOS failures", as
   await assertRejects(
     () =>
       testModel.methods.pushRouting.execute(
-        { dryRun: true },
+        {
+          dryRun: true,
+          connection: sshConnection,
+          // The EMPTY routing intent, which is the case under test: it parses
+          // but generates no configuration lines, and the method must refuse
+          // rather than apply nothing and report success.
+          routing: emptyRoutingArgs.routing,
+        },
         emptyRouting.context as never,
       ),
     Error,

@@ -1,4 +1,10 @@
-import type { AccessPortRange, CiscoIosGlobalArgs, Vlan } from "./_ssh.ts";
+import type {
+  AccessPortRange,
+  CiscoIosBaseline,
+  CiscoIosRoutingPayload,
+  CiscoIosSnmpPayload,
+  Vlan,
+} from "./_ssh.ts";
 
 /**
  * Pure IOS config-line generators and output sanitizers for the
@@ -8,7 +14,7 @@ import type { AccessPortRange, CiscoIosGlobalArgs, Vlan } from "./_ssh.ts";
  */
 
 /** Secure-access hardening lines asserted idempotently by `applyBaseline`. */
-export function baselineLines(g: CiscoIosGlobalArgs): string[] {
+export function baselineLines(g: CiscoIosBaseline): string[] {
   const lines: string[] = [];
   if (g.hostname) lines.push(`hostname ${g.hostname}`);
   if (g.domainName) lines.push(`ip domain-name ${g.domainName}`);
@@ -33,7 +39,7 @@ export function baselineLines(g: CiscoIosGlobalArgs): string[] {
 }
 
 /** SNMPv2c lines from `globalArguments.snmp`. */
-export function snmpLines(g: CiscoIosGlobalArgs): string[] {
+export function snmpLines(g: CiscoIosSnmpPayload): string[] {
   const s = g.snmp!;
   const lines: string[] = [];
   if (s.readOnly) lines.push(`snmp-server community ${s.readOnly} RO`);
@@ -48,7 +54,7 @@ export function snmpLines(g: CiscoIosGlobalArgs): string[] {
 }
 
 /** Layer-3 / VLAN lines from `globalArguments.routing`. */
-export function routingLines(g: CiscoIosGlobalArgs): string[] {
+export function routingLines(g: CiscoIosRoutingPayload): string[] {
   const r = g.routing!;
   const lines: string[] = [];
   if (r.enabled) lines.push("ip routing");
